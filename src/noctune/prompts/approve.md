@@ -4,7 +4,7 @@ You will be given:
 - file path + qname
 - BEFORE code (original symbol)
 - AFTER code (candidate symbol that already passed syntax + ruff gates on a temp file)
-- selector intent + change_spec summary
+- draft intent + acceptance + edit_prompt excerpt (plus optional legacy change_spec summary)
 - gate summary (parse ok, ruff ok, key warnings if any)
 
 Decide whether to allow patching the real file.
@@ -18,7 +18,7 @@ Reject if ANY are true:
 - Signature changed, decorator changed, or public API surface expanded without evidence.
 - Adds unused symbols or “future hooks”.
 - Introduces new correctness/safety risk or masks failures.
-- Selector intent/spec is not actually implemented.
+- Draft intent/acceptance is not actually implemented.
 
 Approve only if:
 - The change advances toward a W-grade outcome, and

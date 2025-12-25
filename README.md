@@ -88,37 +88,30 @@ Artifacts are written under:
 For each file, Noctune executes a resumable flow:
 
 1. Plan
-- Writes `plan.md` (or `plan.json`) per file.
+- Writes `plan.md` per file.
 - Establishes a small, explicit plan and constraints.
 
 2. Review
 - Writes `review.md` and a label (`N`, `P`, `W`).
 - Defines what must change to reach `W` (high-leverage checklist).
 
-3. Select
-- Writes `selection.json`.
-- Uses the review plus minimal evidence to choose 1–3 high-leverage symbols/chunks and produces a concrete “change spec” (free-form bullets/pseudo-code).
+3. Draft
+- Writes `draft.json`.
+- Uses the review plus minimal evidence to choose 1–3 high-leverage symbols/chunks and produces a concrete an editor-ready payload: `edit_prompt` (plain text) + `draft_code` (near-final replacement code).
 
 4. Edit (temp-first)
-- Editor sees only the symbol code + selector change spec (not the full file).
+- Editor sees only the symbol code + Draft payload (edit_prompt + draft_code) (not the full file).
 - Applies to work copy, runs gates, repairs if needed.
 
 5. Approve
 - Approver compares BEFORE vs AFTER (no unified diff) and approves/rejects patching the real file.
 
 6. Iterate
-- Repeat `review → select → edit → approve` until `W` or pass limit.
+- Repeat `review → draft → edit → approve` until `W` or pass limit.
 
-2. In the “Commands” section, adjust these descriptions to reflect that:
-
-- `noctune plan` does only plan
-- `noctune review` does only review
-- `noctune edit` should require that `selection.json` already exists (or it can internally run `select` if missing, but the conceptual pipeline is still Review → Select → Edit)
-- `noctune run` orchestrates: plan → review → select → edit → approve, then loops review/select/edit/approve until W or max passes.
-
-If you want the tooling to be consistent with the docs, you should also ensure the actual orchestrator calls stages in that order. If the code currently runs select before review, fix order in the orchestrator (typically a single function like `run_file_pipeline(...)`).
-
-If you tell me whether you want `noctune edit` to automatically trigger `select` when missing (convenient) or to refuse and instruct the user to run `noctune select` first (stricter), I’ll give you the exact wording for the README and the cleanest behavior for v1.
+Notes on orchestration:
+- `noctune edit` will create any missing prerequisites for a file (plan, review, draft) before attempting edits.
+- `noctune run` orchestrates: plan → review → draft → edit → approve, then loops review/draft/edit/approve until Label `W` or max passes.
 
 
 Important constraints:
@@ -130,7 +123,7 @@ Important constraints:
 
 Noctune follows a “ruff-like” CLI shape:
 
-- `noctune plan` — generate `plan.json` per file.
+- `noctune plan` — generate `plan.md` per file.
 - `noctune review` — generate `review.md` per file.
 - `noctune edit` — run one edit pass per file (plan + review + edit + gates).
 - `noctune repair` — attempt to repair the current file state using deterministic and micro-LLM repair.
@@ -158,7 +151,7 @@ Noctune discovers configuration in this order:
 Noctune ships default prompts inside the package, but always writes repo-local overrides on `init`:
 
 - `./.noctune_cache/overrides/plan.md`
-- `./.noctune_cache/overrides/select.md`
+- `./.noctune_cache/overrides/draft.md`
 - `./.noctune_cache/overrides/review.md`
 - `./.noctune_cache/overrides/edit.md`
 - `./.noctune_cache/overrides/repair.md`

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,7 @@ from .state import (
     read_bytes,
     save_json,
     sha256_bytes,
+    sha256_text,
     write_text,
 )
 
@@ -65,6 +67,44 @@ def _label_from_review(text: str) -> Optional[str]:
         return m.group(1)
     m2 = re.search(r"\bLabel\s*:\s*([NPW])\b", text)
     return m2.group(1) if m2 else None
+
+
+def _llm_chat_logged(
+    *,
+    llm: LLMClient,
+    system: str,
+    user: str,
+    logger: EventLogger,
+    stage: str,
+    tag: str,
+    verbose_llm: bool,
+    stream: bool = True,
+) -> tuple[bool, str]:
+    t0 = time.time()
+    ok, out = llm.chat(
+        system=system,
+        user=user,
+        stream=stream,
+        verbose=verbose_llm,
+        tag=tag,
+    )
+    elapsed_ms = int((time.time() - t0) * 1000)
+    try:
+        out_hash = sha256_text(out) if out else ""
+    except Exception:
+        out_hash = ""
+    logger.info(
+        event="llm_call",
+        stage=stage,
+        tag=tag,
+        ok=ok,
+        elapsed_ms=elapsed_ms,
+        system_chars=len(system or ""),
+        user_chars=len(user or ""),
+        output_chars=len(out or ""),
+        output_sha256=out_hash,
+    )
+    return ok, out
 
 
 def _impact_pack(root: Path, src_text: str, *, max_names: int = 10):
@@ -398,18 +438,21 @@ def _do_plan(
         + "\n\nSource:\n"
         + src_text
     )
-    ok, out = llm.chat(
+    ok, out = _llm_chat_logged(
+        llm=llm,
         system=system,
         user=user,
-        stream=True,
-        verbose=verbose_llm,
+        logger=logger,
+        stage="plan",
         tag=f"plan:{rel_path}",
+        verbose_llm=verbose_llm,
+        stream=True,
     )
     write_text(plan_path, out + "\n")
     logger.info(event="plan_written", rel_path=rel_path, ok=ok)
 
 
-def _do_select(
+def _do_draft(
     root: Path,
     rel_path: str,
     raw: bytes,
@@ -418,18 +461,19 @@ def _do_select(
     verbose_llm: bool,
     logger: EventLogger,
 ) -> None:
-    """Selection must be guided by the latest review; keep it as a distinct stage."""
-    sel_path = os.path.join(task_art, "selection.json")
-    if os.path.exists(sel_path):
+    """Draft must be guided by the latest review; keep it as a distinct stage."""
+    draft_path = os.path.join(task_art, "draft.json")
+
+    if os.path.exists(draft_path):
         return
 
     if llm is None:
+        obj = {"file": rel_path, "targets": []}
+        payload = json.dumps(obj, indent=2, ensure_ascii=False) + "\n"
+        write_text(draft_path, payload)
         write_text(
-            sel_path, json.dumps({"file": rel_path, "targets": []}, indent=2) + "\n"
-        )
-        write_text(
-            os.path.join(task_art, "selection.raw.txt"),
-            "LLM disabled; skipping selection.\n",
+            os.path.join(task_art, "draft.raw.txt"),
+            "LLM disabled; skipping draft.\n",
         )
         return
 
@@ -446,7 +490,7 @@ def _do_select(
         except Exception:
             review_text = ""
 
-    system = load_prompt(root, "select.md")
+    system = load_prompt(root, "draft.md")
     callsite_lines: list[str] = []
     for k, hits in (impact.callsites or {}).items():
         callsite_lines.append(f"## {k}")
@@ -464,20 +508,27 @@ def _do_select(
         "Source:\n" + src_text
     )
 
-    ok, out = llm.chat(
+    ok, out = _llm_chat_logged(
+        llm=llm,
         system=system,
         user=user,
+        logger=logger,
+        stage="draft",
+        tag=f"draft:{rel_path}",
+        verbose_llm=verbose_llm,
         stream=True,
-        verbose=verbose_llm,
-        tag=f"select:{rel_path}",
     )
-    write_text(os.path.join(task_art, "selection.raw.txt"), out + "\n")
+
+    write_text(os.path.join(task_art, "draft.raw.txt"), out + "\n")
     ok2, err, obj = _best_effort_json(out)
     if not ok2 or not obj:
         obj = {"file": rel_path, "targets": []}
-        write_text(os.path.join(task_art, "selection_parse_error.txt"), err + "\n")
-    write_text(sel_path, json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
-    logger.info(event="selection_written", rel_path=rel_path, ok=ok)
+        write_text(os.path.join(task_art, "draft_parse_error.txt"), err + "\n")
+        logger.warn(event="draft_parse_failed", rel_path=rel_path, error=err[:4000])
+
+    payload = json.dumps(obj, indent=2, ensure_ascii=False) + "\n"
+    write_text(draft_path, payload)
+    logger.info(event="draft_written", rel_path=rel_path, ok=ok)
 
 
 def _do_review(
@@ -511,12 +562,15 @@ def _do_review(
         "Callsites:\n" + "\n".join(callsite_lines[:600]) + "\n\n"
         "Source:\n" + src_text
     )
-    ok, out = llm.chat(
+    ok, out = _llm_chat_logged(
+        llm=llm,
         system=system,
         user=user,
-        stream=True,
-        verbose=verbose_llm,
+        logger=logger,
+        stage="review",
         tag=f"review:{rel_path}",
+        verbose_llm=verbose_llm,
+        stream=True,
     )
     write_text(review_path, out + "\n")
     logger.info(
@@ -554,18 +608,21 @@ def _do_edit(
     if not os.path.exists(review_path):
         _do_review(root, rel_path, raw, task_art, llm, verbose_llm, logger)
 
-    sel_path = os.path.join(task_art, "selection.json")
-    # Selection must track the latest review; if review is newer, regenerate selection.
+    draft_path = os.path.join(task_art, "draft.json")
+
     try:
-        if os.path.exists(sel_path) and os.path.exists(review_path):
-            if os.path.getmtime(review_path) > os.path.getmtime(sel_path):
-                os.remove(sel_path)
+        if os.path.exists(review_path):
+            if os.path.exists(draft_path) and os.path.getmtime(
+                review_path
+            ) > os.path.getmtime(draft_path):
+                os.remove(draft_path)
     except Exception:
         pass
-    if not os.path.exists(sel_path):
-        _do_select(root, rel_path, raw, task_art, llm, verbose_llm, logger)
 
-    selection = load_json(sel_path, default={})
+    if not os.path.exists(draft_path):
+        _do_draft(root, rel_path, raw, task_art, llm, verbose_llm, logger)
+
+    selection = load_json(draft_path, default={})
     targets = selection.get("targets", []) or []
     if not isinstance(targets, list):
         targets = []
@@ -595,9 +652,8 @@ def _do_edit(
         qname = str(t.get("qname", "")).strip()
         if not qname or qname not in sym_map:
             continue
-        spec = t.get("change_spec", [])
-        if not isinstance(spec, list):
-            spec = [str(spec)]
+        edit_prompt = str(t.get("edit_prompt", "") or "").strip()
+        draft_code = str(t.get("draft_code", "") or "").strip()
 
         # BEFORE from current real_bytes (may change as we apply)
         cur_real_text = real_bytes.decode("utf-8", errors="replace")
@@ -612,14 +668,20 @@ def _do_edit(
         user = (
             f"Path: {rel_path}\nQname: {qname}\n\n"
             "Current symbol code:\n" + before_code + "\n\n"
-            "Change spec:\n- " + "\n- ".join([str(x) for x in spec][:30]) + "\n"
+            "Edit prompt (plain text; follow deterministically):\n"
+            + (edit_prompt + "\n\n" if edit_prompt else "(missing)\n\n")
+            + "Draft replacement code (follow as source of truth; keep signature/decorators from current code):\n"
+            + (draft_code + "\n\n" if draft_code else "(missing)\n\n")
         )
-        ok, out = llm.chat(
+        ok, out = _llm_chat_logged(
+            llm=llm,
             system=system,
             user=user,
-            stream=True,
-            verbose=verbose_llm,
+            logger=logger,
+            stage="edit",
             tag=f"edit:{qname}",
+            verbose_llm=verbose_llm,
+            stream=True,
         )
         write_text(
             os.path.join(task_art, f"edit_{_task_id(qname)}.raw.txt"), out + "\n"
@@ -629,6 +691,12 @@ def _do_edit(
             write_text(
                 os.path.join(task_art, f"edit_{_task_id(qname)}.parse_error.txt"),
                 err + "\n",
+            )
+            logger.warn(
+                event="edit_parse_failed",
+                rel_path=rel_path,
+                qname=qname,
+                error=err[:4000],
             )
             continue
         new_code = str(obj.get("code", ""))
@@ -658,7 +726,14 @@ def _do_edit(
                 os.path.join(task_art, f"apply_{_task_id(qname)}.error.txt"),
                 ar.msg + "\n",
             )
+            logger.warn(
+                event="apply_temp_failed",
+                rel_path=rel_path,
+                qname=qname,
+                msg=ar.msg[:4000],
+            )
             continue
+
         temp_text = ar.updated_source
         temp_bytes = temp_text.encode("utf-8")
         with open(work_abs, "wb") as f:
@@ -746,7 +821,18 @@ def _do_edit(
                 f.write(temp_bytes)
             write_text(
                 os.path.join(task_art, f"gate_fail_{_task_id(qname)}.txt"),
-                f"parse_ok={parse_ok} ruff_ok={ruff_ok}\n{parse_err or ''}\n{ruff_out or ''}\n{ruff_err or ''}\n",
+                f"parse_ok={parse_ok} ruff_ok={ruff_ok}\n"
+                f"{parse_err or ''}\n"
+                f"{ruff_out or ''}\n"
+                f"{ruff_err or ''}\n",
+            )
+            logger.warn(
+                event="gate_failed",
+                rel_path=rel_path,
+                qname=qname,
+                parse_ok=parse_ok,
+                ruff_ok=ruff_ok,
+                parse_err=(parse_err or "")[:2000],
             )
             continue
 
@@ -765,22 +851,36 @@ def _do_edit(
 
         approve_system = load_prompt(root, "approve.md")
         intent = str(t.get("intent", "")).strip()
-        spec_summary = "- " + "\n- ".join([str(x) for x in spec][:30])
+        edit_prompt_ap = str(t.get("edit_prompt", "") or "").strip()
+
+        acceptance = t.get("acceptance", []) or []
+        if not isinstance(acceptance, list):
+            acceptance = [str(acceptance)]
+        acceptance_summary = "- " + "\n- ".join(
+            [str(x) for x in acceptance if str(x).strip()][:30]
+        )
+        if acceptance_summary == "- ":
+            acceptance_summary = "(none)"
+
         gate_summary = "parse_ok=True\nruff_ok=True\n"
         user2 = (
             f"Path: {rel_path}\nQname: {qname}\n\n"
-            f"Selector intent: {intent}\n\n"
-            f"Change spec:\n{spec_summary}\n\n"
+            f"Draft intent: {intent}\n\n"
+            f"Acceptance criteria:\n{acceptance_summary}\n\n"
+            f"Edit prompt (excerpt):\n{(edit_prompt_ap[:2000] + ('…' if len(edit_prompt_ap) > 2000 else ''))}\n\n"
             f"Gate summary:\n{gate_summary}\n"
             "BEFORE:\n" + before_code + "\n\n"
             "AFTER:\n" + after_code + "\n"
         )
-        ok_a, out_a = llm.chat(
+        ok_a, out_a = _llm_chat_logged(
+            llm=llm,
             system=approve_system,
             user=user2,
-            stream=True,
-            verbose=verbose_llm,
+            logger=logger,
+            stage="approve",
             tag=f"approve:{qname}",
+            verbose_llm=verbose_llm,
+            stream=True,
         )
         write_text(
             os.path.join(task_art, f"approve_{_task_id(qname)}.txt"), out_a + "\n"
@@ -892,7 +992,7 @@ def _do_run_full(
     ruff_fix_mode: str,
     logger: EventLogger,
 ) -> None:
-    # Full loop: plan -> review -> select -> edit -> approve; then repeat review/select/edit as needed.
+    # Full loop: plan -> review -> draft -> edit -> approve; then repeat review/draft/edit as needed.
     max_passes = 3
     for p in range(max_passes):
         _do_plan(
@@ -908,14 +1008,13 @@ def _do_run_full(
         if lbl == "W":
             return
 
-        # Selection is review-guided; regenerate each pass.
-        sel_path = os.path.join(task_art, "selection.json")
+        pth = os.path.join(task_art, "draft.json")
         try:
-            if os.path.exists(sel_path):
-                os.remove(sel_path)
+            if os.path.exists(pth):
+                os.remove(pth)
         except Exception:
             pass
-        _do_select(
+        _do_draft(
             root, rel_path, read_bytes(real_abs), task_art, llm, verbose_llm, logger
         )
 
@@ -933,8 +1032,8 @@ def _do_run_full(
             ruff_fix_mode=ruff_fix_mode,
             logger=logger,
         )
-        # Refresh review + selection for next pass.
-        for fp in ("review.md", "selection.json"):
+        # Refresh review + draft for next pass.
+        for fp in ("review.md", "draft.json", "selection.json"):
             pth = os.path.join(task_art, fp)
             try:
                 if os.path.exists(pth):

@@ -8,7 +8,7 @@ from pathlib import Path
 _PROMPT_FILES = (
     "plan.md",
     "review.md",
-    "select.md",
+    "draft.md",
     "edit.md",
     "repair.md",
     "approve.md",

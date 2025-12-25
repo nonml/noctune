@@ -205,9 +205,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_init)
 
     for name, fn, help_txt in [
-        ("plan", cmd_plan, "Create plan.md and selection.json artifacts"),
+        ("plan", cmd_plan, "Create plan.md artifact"),
         ("review", cmd_review, "Create review.md artifact"),
-        ("edit", cmd_edit, "Selector+Editor+Approver pass (patches only if approved)"),
+        ("edit", cmd_edit, "Draft+Editor+Approver pass (patches only if approved)"),
         ("repair", cmd_repair, "Heuristic + ruff repair only"),
         (
             "run",
