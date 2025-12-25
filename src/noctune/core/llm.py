@@ -8,6 +8,24 @@ from dataclasses import dataclass
 from typing import Any
 
 
+def build_chat_completions_url(base_url: str) -> str:
+    """Build a correct OpenAI-compatible /v1/chat/completions URL.
+
+    Accepts base_url forms:
+      - http://127.0.0.1:8080
+      - http://127.0.0.1:8080/v1
+      - http://127.0.0.1:8080/v1/chat/completions
+    """
+    b = (base_url or "").strip().rstrip("/")
+    if not b:
+        raise ValueError("LLM base_url is empty")
+    if b.endswith("/v1/chat/completions"):
+        return b
+    if b.endswith("/v1"):
+        return b + "/chat/completions"
+    return b + "/v1/chat/completions"
+
+
 def _extract_text(x: Any) -> str:
     """Best-effort extraction of text from OpenAI-style streaming delta fields."""
     if x is None:
@@ -63,7 +81,7 @@ class LLMClient:
     ) -> tuple[bool, str]:
         if self.mode != "openai_chat":
             return False, f"Unsupported LLM mode: {self.mode}"
-        url = self.base_url.rstrip("/") + "/v1/chat/completions"
+        url = build_chat_completions_url(self.base_url)
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"

@@ -51,10 +51,7 @@ def ripgrep_callsites(
             except FileNotFoundError:
                 return {n: ["ripgrep (rg) not found on PATH"] for n in names}
             for line in cp.stdout.splitlines():
-                # Avoid scanning tool output/cache directories.
-                lp = line.replace("\\", "/")
-                # Match both absolute and relative forms.
-                if "/.noctune_cache/" in lp or ".noctune_cache/" in lp:
+                if ".noctune_cache/" in line.replace("\\", "/"):
                     continue
                 hits.append(line[:500])
                 if len(hits) >= max_hits_per_name:

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from .core.config import NoctuneConfig, load_config, write_noctune_toml
-from .core.paths import RepoPaths
 from .core.prompts import ensure_prompt_overrides
-from .core.runner import run_noctune
+from .core.runner import run_stage
 from .core.scanner import RepoScanner
+from .core.state import find_latest_run_id
 from .core.tools import which
 
 
@@ -21,343 +22,222 @@ def _prompt_yes_no(msg: str, default_no: bool = True) -> bool:
 
 def _ensure_tooling(cfg: NoctuneConfig) -> None:
     if cfg.ruff_required and not which("ruff"):
-        raise SystemExit(
-            "noctune: ruff is required but not found on PATH. Install ruff and retry."
-        )
-    # rg is optional by design; you can add a warning later.
+        raise SystemExit("noctune: ruff is required but not found on PATH")
+    if not cfg.rg_optional and not which("rg"):
+        raise SystemExit("noctune: ripgrep (rg) is required but not found on PATH")
+
+
+def _collect_rel_paths(
+    root: Path, paths: list[str], file_list: str | None
+) -> list[str]:
+    scanner = RepoScanner.create(root)
+    if file_list:
+        items = scanner.from_file_list(Path(file_list))
+        return [p.relative_to(root).as_posix() for p in items]
+
+    if paths:
+        out: list[str] = []
+        for s in paths:
+            p = (root / s).resolve()
+            if p.is_dir():
+                for f in scanner.iter_py_files(p):
+                    out.append(f.relative_to(root).as_posix())
+            else:
+                if p.exists() and p.suffix == ".py":
+                    out.append(p.relative_to(root).as_posix())
+        return out
+
+    # default: entire repo
+    return [p.relative_to(root).as_posix() for p in scanner.iter_py_files(root)]
 
 
 def cmd_init(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
-    rp = RepoPaths.from_root(root)
-    rp.ensure()
+    root.mkdir(parents=True, exist_ok=True)
 
-    # Load existing (if any), then prompt for missing pieces
-    cfg, _cfg_path, _raw = load_config(root)
+    cfg, cfg_path, _ = load_config(root)
 
-    if args.base_url:
-        cfg.llm.base_url = args.base_url
-
-    if not cfg.llm.base_url:
-        cfg.llm.base_url = input(
-            "LLM base_url (OpenAI-compatible, e.g. http://127.0.0.1:8080): "
-        ).strip()
-
-    if args.api_key is not None:
-        cfg.llm.api_key = args.api_key
-    elif cfg.llm.api_key is None:
-        k = input("API key (optional, press enter to skip): ").strip()
-        cfg.llm.api_key = k or None
-
-    if args.allow_apply is not None:
-        cfg.allow_apply = bool(args.allow_apply)
-    else:
-        # Ask once here; later commands can also prompt if missing.
-        cfg.allow_apply = _prompt_yes_no(
-            "Allow Noctune to modify files in this repo?", default_no=True
-        )
-
-    path = write_noctune_toml(root, cfg)
-    print(f"noctune: wrote config: {path}")
-
-    if args.gitignore_prompt:
-        gi = root / ".gitignore"
-        line = ".noctune_cache/\n"
-        if _prompt_yes_no("Add .noctune_cache/ to .gitignore?", default_no=False):
-            existing = (
-                gi.read_text(encoding="utf-8", errors="ignore") if gi.exists() else ""
+    # First-time config file
+    out_cfg = root / "noctune.toml"
+    if not out_cfg.exists():
+        allow_apply = False
+        if os.isatty(0) and not args.yes:
+            allow_apply = _prompt_yes_no(
+                "Allow Noctune to patch files in this repo?", default_no=True
             )
-            if ".noctune_cache/" not in existing:
+        write_noctune_toml(
+            out_cfg,
+            cfg,
+            allow_apply=allow_apply,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+        )
+        print(f"wrote {out_cfg}")
+
+    # Ensure prompt overrides exist for easy user editing
+    od = ensure_prompt_overrides(root, overwrite=bool(args.overwrite_prompts))
+    print(f"prompt overrides: {od}")
+
+    # Optional .gitignore update (best-effort)
+    gi = root / ".gitignore"
+    if gi.exists():
+        text = gi.read_text(encoding="utf-8", errors="ignore")
+    else:
+        text = ""
+    if ".noctune_cache/" not in text and ".noctune_cache" not in text:
+        if os.isatty(0) and not args.yes:
+            if _prompt_yes_no("Add .noctune_cache/ to .gitignore?", default_no=False):
                 gi.write_text(
-                    existing
-                    + ("" if existing.endswith("\n") or existing == "" else "\n")
-                    + line,
+                    text
+                    + ("\n" if text and not text.endswith("\n") else "")
+                    + ".noctune_cache/\n",
                     encoding="utf-8",
                 )
-                print("noctune: updated .gitignore")
-            else:
-                print("noctune: .gitignore already contains .noctune_cache/")
-        else:
-            print(
-                "noctune: skipped .gitignore update. Add this line if desired: .noctune_cache/"
-            )
-
-    ensure_prompt_overrides(root, overwrite=False)
-    print(
-        f"noctune: prompt overrides created at: {root / '.noctune_cache' / 'overrides'}"
-    )
+                print("updated .gitignore")
 
     return 0
 
 
-def _collect_paths(root: Path, paths: list[str], file_list: str | None) -> list[Path]:
-    scanner = RepoScanner.create(root)
-    if file_list:
-        fl = Path(file_list)
-        if not fl.is_absolute():
-            fl = (root / fl).resolve()
-        return scanner.from_file_list(fl)
-    if not paths:
-        # default to root scan
-        return list(scanner.iter_python_files())
+def _cmd_stage(stage: str, args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    cfg, _, _ = load_config(root)
+    _ensure_tooling(cfg)
 
-    out: list[Path] = []
-    for p in paths:
-        pp = (root / p).resolve() if not Path(p).is_absolute() else Path(p).resolve()
-        if pp.is_dir():
-            # scan within that directory
-            for f in pp.rglob("*.py"):
-                # apply scanner filtering by reusing full scan and filtering membership is expensive;
-                # keep simple for v0: only include files under dir, then ignore rules.
-                rel = f.relative_to(root)
-                if scanner.gitignore.is_ignored(rel.as_posix()):
-                    continue
-                if rel.parts and rel.parts[0] in (
-                    ".noctune_cache",
-                    ".git",
-                    ".venv",
-                    "venv",
-                    "__pycache__",
-                    "build",
-                    "dist",
-                ):
-                    continue
-                out.append(f)
-        else:
-            if pp.exists() and pp.suffix == ".py":
-                rel = pp.relative_to(root)
-                if not scanner.gitignore.is_ignored(rel.as_posix()):
-                    out.append(pp)
-    return out
-
-
-def _require_apply_permission(cfg: NoctuneConfig, yes: bool) -> None:
-    if cfg.allow_apply:
-        return
-    if yes:
-        # In non-interactive mode, require explicit --yes; caller can persist by writing config later.
-        raise SystemExit(
-            "noctune: refusing to modify files without allow_apply=true in config. Run `noctune init` or re-run without --yes to approve interactively."
-        )
-    # Interactive prompt
-    if not _prompt_yes_no(
-        "Noctune needs permission to modify files in this repo. Allow now?",
-        default_no=True,
-    ):
-        raise SystemExit("noctune: permission denied; no changes made.")
-
-
-def _run_stage(
-    stage: str,
-    *,
-    root: Path,
-    cfg: NoctuneConfig,
-    files: list[Path],
-    run_id: str | None,
-    max_files: int | None,
-    ruff_fix: str,
-    llm: str,
-    verbose_stream: bool,
-    log_level: str,
-) -> int:
-    return run_noctune(
-        stage,
+    rel_paths = _collect_rel_paths(
+        root, getattr(args, "paths", []) or [], args.file_list
+    )
+    return run_stage(
+        stage=stage,
         root=root,
+        rel_paths=rel_paths,
         cfg=cfg,
-        run_id=run_id,
-        files=files,
-        max_files=max_files,
-        ruff_fix=(ruff_fix == "safe"),
-        llm_enabled=(llm == "on"),
-        log_level=log_level,
-        verbose_stream=verbose_stream,
+        run_id=args.run_id,
+        max_files=args.max_files,
+        ruff_fix_mode=args.ruff_fix,
+        llm_enabled=(args.llm == "on"),
+        log_level=args.log_level,
+        verbosity=args.v,
     )
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
-    root = Path(args.root).resolve()
-    cfg, _, _ = load_config(root)
-    files = _collect_paths(root, args.paths, args.file_list)
-    return _run_stage(
-        "plan",
-        root=root,
-        cfg=cfg,
-        files=files,
-        run_id=args.run_id,
-        max_files=args.max_files,
-        ruff_fix=args.ruff_fix,
-        llm=args.llm,
-        verbose_stream=cfg.llm.verbose_stream or bool(args.v),
-        log_level=args.log_level,
-    )
+    return _cmd_stage("plan", args)
 
 
 def cmd_review(args: argparse.Namespace) -> int:
-    root = Path(args.root).resolve()
-    cfg, _, _ = load_config(root)
-    files = _collect_paths(root, args.paths, args.file_list)
-    return _run_stage(
-        "review",
-        root=root,
-        cfg=cfg,
-        files=files,
-        run_id=args.run_id,
-        max_files=args.max_files,
-        ruff_fix=args.ruff_fix,
-        llm=args.llm,
-        verbose_stream=cfg.llm.verbose_stream or bool(args.v),
-        log_level=args.log_level,
-    )
+    return _cmd_stage("review", args)
 
 
 def cmd_edit(args: argparse.Namespace) -> int:
-    root = Path(args.root).resolve()
-    cfg, _, _ = load_config(root)
-    _ensure_tooling(cfg)
-    _require_apply_permission(cfg, yes=bool(args.yes))
-    files = _collect_paths(root, args.paths, args.file_list)
-    return _run_stage(
-        "edit",
-        root=root,
-        cfg=cfg,
-        files=files,
-        run_id=args.run_id,
-        max_files=args.max_files,
-        ruff_fix=args.ruff_fix,
-        llm=args.llm,
-        verbose_stream=cfg.llm.verbose_stream or bool(args.v),
-        log_level=args.log_level,
-    )
+    return _cmd_stage("edit", args)
 
 
 def cmd_repair(args: argparse.Namespace) -> int:
-    root = Path(args.root).resolve()
-    cfg, _, _ = load_config(root)
-    _ensure_tooling(cfg)
-    _require_apply_permission(cfg, yes=bool(args.yes))
-    files = _collect_paths(root, args.paths, args.file_list)
-    return _run_stage(
-        "repair",
-        root=root,
-        cfg=cfg,
-        files=files,
-        run_id=args.run_id,
-        max_files=args.max_files,
-        ruff_fix=args.ruff_fix,
-        llm=args.llm,
-        verbose_stream=cfg.llm.verbose_stream or bool(args.v),
-        log_level=args.log_level,
-    )
+    return _cmd_stage("repair", args)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    root = Path(args.root).resolve()
-    cfg, _, _ = load_config(root)
-    _ensure_tooling(cfg)
-    _require_apply_permission(cfg, yes=bool(args.yes))
-    files = _collect_paths(root, args.paths, args.file_list)
-    return _run_stage(
-        "run",
-        root=root,
-        cfg=cfg,
-        files=files,
-        run_id=args.run_id,
-        max_files=args.max_files,
-        ruff_fix=args.ruff_fix,
-        llm=args.llm,
-        verbose_stream=cfg.llm.verbose_stream or bool(args.v),
-        log_level=args.log_level,
-    )
+    return _cmd_stage("run", args)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    # Common options should be accepted both BEFORE and AFTER the subcommand.
     common = argparse.ArgumentParser(add_help=False)
-
     common.add_argument("--root", default=".", help="Repo root (default: .)")
     common.add_argument(
         "--file-list",
         default=None,
         help="Text file with one relative .py path per line",
     )
-    common.add_argument("--run-id", default=None, help="Resume/use a specific run id")
     common.add_argument(
-        "--max-files", type=int, default=None, help="Process at most N files"
+        "--run-id", default=None, help="Reuse an existing run-id (resume)"
+    )
+    common.add_argument(
+        "--max-files", type=int, default=None, help="Stop after N files"
     )
     common.add_argument(
         "--ruff-fix",
         choices=["safe", "off"],
         default="safe",
-        help="Whether to run `ruff check --fix` (safe fixes only) during repair",
+        help="Apply ruff --fix on temp/work file",
     )
     common.add_argument(
-        "--llm",
-        choices=["on", "off"],
-        default="on",
-        help="Enable/disable LLM calls (off = no-op/stub for debugging)",
+        "--llm", choices=["on", "off"], default="on", help="Enable/disable LLM calls"
     )
     common.add_argument(
-        "--log-level",
-        choices=["DEBUG", "INFO", "WARN", "ERROR"],
-        default="INFO",
-        help="Console log level",
+        "--log-level", choices=["DEBUG", "INFO", "WARN", "ERROR"], default="INFO"
     )
     common.add_argument(
         "-v", action="count", default=0, help="Increase verbosity (-v, -vv)"
     )
     common.add_argument(
-        "--yes",
+        "--yes", action="store_true", help="Non-interactive mode (init prompts)"
+    )
+    common.add_argument(
+        "--continue",
+        dest="continue_last",
         action="store_true",
-        help="Non-interactive mode (also used for permission gating)",
+        help="Resume the most recent run id under --root/.noctune_cache/runs/ (ignored if --run-id is set)",
     )
 
-    # Top-level parser also includes common options so `noctune --root . run` works.
-    p = argparse.ArgumentParser(prog="noctune", parents=[common], add_help=True)
+    p = argparse.ArgumentParser(prog="noctune")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # init
     sp = sub.add_parser(
-        "init",
-        parents=[common],
-        help="First-time setup (config + permissions + optional .gitignore update)",
+        "init", parents=[common], help="First-time setup: config + prompt overrides"
     )
-    sp.add_argument("--base-url", default=None, help="LLM base_url (OpenAI-compatible)")
-    sp.add_argument("--api-key", default=None, help="API key (optional)")
     sp.add_argument(
-        "--allow-apply",
-        choices=["true", "false"],
+        "--base-url",
         default=None,
-        help="Set allow_apply explicitly",
+        help="LLM base URL (OpenAI-compatible). Example: http://127.0.0.1:8001/v1",
     )
     sp.add_argument(
-        "--no-gitignore-prompt",
-        dest="gitignore_prompt",
-        action="store_false",
-        help="Do not prompt to update .gitignore",
+        "--model", default=None, help="Model name (optional; server may default)"
     )
-    sp.set_defaults(func=cmd_init, gitignore_prompt=True)
+    sp.add_argument(
+        "--api-key", default=None, help="API key (optional for local servers)"
+    )
+    sp.add_argument(
+        "--overwrite-prompts",
+        action="store_true",
+        help="Overwrite prompt overrides with packaged defaults",
+    )
+    sp.set_defaults(func=cmd_init)
 
-    # plan/review/edit/repair/run
-    for name, fn in [
-        ("plan", cmd_plan),
-        ("review", cmd_review),
-        ("edit", cmd_edit),
-        ("repair", cmd_repair),
-        ("run", cmd_run),
+    for name, fn, help_txt in [
+        ("plan", cmd_plan, "Create plan.md and selection.json artifacts"),
+        ("review", cmd_review, "Create review.md artifact"),
+        ("edit", cmd_edit, "Selector+Editor+Approver pass (patches only if approved)"),
+        ("repair", cmd_repair, "Heuristic + ruff repair only"),
+        (
+            "run",
+            cmd_run,
+            "Full loop: plan -> review -> edit -> review (up to a few passes)",
+        ),
     ]:
-        sc = sub.add_parser(name, parents=[common], help=f"{name} pipeline stage")
-        sc.add_argument("paths", nargs="*", help="Paths/files (default: scan repo)")
-        sc.set_defaults(func=fn)
+        spx = sub.add_parser(name, parents=[common], help=help_txt)
+        spx.add_argument(
+            "paths",
+            nargs="*",
+            help="Optional file(s) or directory(ies); default is whole repo",
+        )
+        spx.set_defaults(func=fn)
 
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    # normalize allow_apply flag parsing for init
-    if getattr(args, "allow_apply", None) in ("true", "false"):
-        args.allow_apply = args.allow_apply == "true"
+    args = build_parser().parse_args(argv)
+    root = Path(getattr(args, "root", ".")).resolve()
+
+    if getattr(args, "continue_last", False) and not getattr(args, "run_id", None):
+        rid = find_latest_run_id(root)
+        if not rid:
+            raise SystemExit(
+                "noctune: --continue was set but no prior runs were found under "
+                f"{root / '.noctune_cache' / 'runs'}"
+            )
+        args.run_id = rid
     return int(args.func(args))
 
 

@@ -1,17 +1,11 @@
-You are planning a focused improvement pass for ONE Python file.
+You are planning a focused improvement pass for ONE Python file in a repository.
 
-Goal: propose the smallest set of edits that would plausibly move the file toward Label W under the review rubric.
-Constraints:
-- Edit only this file.
-- Avoid broad refactors and formatting churn.
-- Prefer per-symbol changes (functions or class methods) over whole-file rewrites.
-- No tests will be executed; do not require running code.
+Goal:
+- Produce a small, explicit plan to improve the file toward a higher quality label (N/P/W).
+- Keep scope local to the focus file unless evidence requires otherwise.
+- Prefer changes that are likely to be used and validated (avoid unused new APIs).
 
-Output (strict JSON, no prose):
-{
-  "target_label": "W",
-  "milestones": [
-    {"id": "M1", "goal": "...", "symbols": ["Foo", "Bar.baz"], "notes": "..."}
-  ],
-  "risks": ["..."]
-}
+Output:
+- A numbered plan (3–8 steps).
+- List the symbols you expect to modify (top-level defs/classes and/or Class.method).
+- State what “done” means for this file.

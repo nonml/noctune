@@ -10,7 +10,8 @@ from typing import Any, Dict, Optional
 
 @dataclass
 class LLMConfig:
-    base_url: str = "http://127.0.0.1:8080"
+    base_url: str = "http://127.0.0.1:8080/v1"
+    base_url: str = "http://127.0.0.1:8080/v1"
     model: Optional[str] = None
     api_key: Optional[str] = None
     headers: Dict[str, str] = field(default_factory=dict)
@@ -101,24 +102,40 @@ def load_config(root: Path) -> tuple[NoctuneConfig, Path | None, Dict[str, Any]]
     return cfg, cfg_path, merged
 
 
-def write_noctune_toml(root: Path, cfg: NoctuneConfig) -> Path:
-    path = root / "noctune.toml"
-    api_key_line = (
-        f'api_key = "{cfg.llm.api_key}"' if cfg.llm.api_key else 'api_key = ""'
-    )
-    model_line = f'model = "{cfg.llm.model}"' if cfg.llm.model else 'model = ""'
+def write_noctune_toml(
+    path: Path,
+    cfg: NoctuneConfig,
+    *,
+    allow_apply: bool | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+) -> Path:
+    """Write a repo-local noctune.toml.
 
-    # Keep this TOML very simple and stable.
+    This file is safe to commit if it contains no secrets. Prefer env vars for secrets:
+      NOCTUNE_BASE_URL, NOCTUNE_API_KEY, NOCTUNE_HEADERS_JSON
+    """
+    allow_apply_val = cfg.allow_apply if allow_apply is None else bool(allow_apply)
+
+    llm = cfg.llm
+    base_url_val = base_url if base_url is not None else llm.base_url
+    api_key_val = api_key if api_key is not None else (llm.api_key or "")
+    model_val = model if model is not None else (llm.model or "")
+
+    model_line = f'model = "{model_val}"' if model_val else "# model = "
+    api_key_line = f'api_key = "{api_key_val}"' if api_key_val else 'api_key = ""'
+
     text = f"""# Noctune configuration (repo-local)
 # This file is safe to commit if it contains no secrets.
 
 [tool.noctune]
-allow_apply = {str(cfg.allow_apply).lower()}
+allow_apply = {str(allow_apply_val).lower()}
 ruff_required = {str(cfg.ruff_required).lower()}
 rg_optional = {str(cfg.rg_optional).lower()}
 
 [tool.noctune.llm]
-base_url = "{cfg.llm.base_url}"
+base_url = "{base_url_val}"
 {model_line}
 {api_key_line}
 stream = {str(cfg.llm.stream).lower()}

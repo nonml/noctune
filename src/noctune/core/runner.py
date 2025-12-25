@@ -4,45 +4,62 @@ import json
 import os
 import re
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Dict, List, Optional, Tuple
 
 from .applier import apply_replace_symbol
 from .config import NoctuneConfig
-from .edit_ops import parse_edit_ops
 from .gates import check_parse, check_ruff, ruff_fix_safe
 from .impact import build_impact
-from .indexer import extract_symbols, index_file
+from .indexer import Symbol, extract_symbols, index_file
 from .llm import LLMClient
 from .logger import EventLogger
 from .prompts import load_prompt
 from .repair import heuristic_basic, micro_llm_repair
-from .scanner import RepoScanner
 from .state import (
     detect_newline_style,
     ensure_run_paths,
     load_json,
-    now_iso,
     read_bytes,
     save_json,
     sha256_bytes,
     write_text,
 )
 
-MAX_PASSES_PER_FILE = 5
 
-
-def _task_id_from_path(rel_path: str) -> str:
+def _task_id(rel_path: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", rel_path)[:180]
 
 
-def _artifact_dir(paths, task_id: str) -> str:
-    d = os.path.join(paths.artifacts_dir, task_id)
-    os.makedirs(d, exist_ok=True)
-    return d
+def _best_effort_json(text: str) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    """Extract and parse the first JSON object found in text."""
+    if not text:
+        return False, "empty", None
+    # strip code fences
+    t = text.strip()
+    t = re.sub(r"^```[a-zA-Z0-9]*\s*", "", t)
+    t = re.sub(r"```\s*$", "", t)
+    # find first { ... } object
+    start = t.find("{")
+    end = t.rfind("}")
+    if start < 0 or end < 0 or end <= start:
+        return False, "no json object", None
+    js = t[start : end + 1]
+    try:
+        return True, "", json.loads(js)
+    except Exception as e:
+        return False, f"json parse error: {e}", None
 
 
-def _label_from_review(text: str) -> str | None:
+def _extract_symbol_source(text: str, sym: Symbol) -> str:
+    lines = text.splitlines(keepends=True)
+    start = max(sym.lineno - 1, 0)
+    end = max(sym.end_lineno, start)
+    return "".join(lines[start:end])
+
+
+def _label_from_review(text: str) -> Optional[str]:
     m = re.search(r"^\s*Label:\s*`?([NPW])`?\s*$", text, re.MULTILINE)
     if m:
         return m.group(1)
@@ -50,998 +67,881 @@ def _label_from_review(text: str) -> str | None:
     return m2.group(1) if m2 else None
 
 
-def _strip_fences(text: str) -> str:
-    t = text.strip()
-    # remove single fence wrapper if present
-    if t.startswith("```"):
-        t = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", t)
-        t = re.sub(r"\s*```\s*$", "", t)
-    return t.strip()
-
-
-def _normalize_newlines(text: str, newline: str) -> str:
-    t = text.replace("\r\n", "\n")
-    if newline == "\n":
-        return t
-    return t.replace("\n", newline)
-
-
-def _write_bytes_preserve_newline(abs_path: str, text: str, newline: str) -> None:
-    data = _normalize_newlines(text, newline).encode("utf-8")
-    with open(abs_path, "wb") as f:
-        f.write(data)
-
-
-def _read_text_utf8(abs_path: str) -> tuple[str, str]:
-    b = read_bytes(abs_path)
-    newline = detect_newline_style(b)
-    return b.decode("utf-8", errors="replace"), newline
-
-
-def _extract_symbol_code(source: str, qname: str) -> str | None:
-    try:
-        syms = extract_symbols(source)
-    except Exception:
-        return None
-    target = None
+def _impact_pack(root: Path, src_text: str, *, max_names: int = 10):
+    syms = extract_symbols(src_text)
+    names: list[str] = []
     for s in syms:
-        if s.qname == qname:
-            target = s
+        # grep the leaf name; keep small
+        leaf = s.qname.split(".")[-1]
+        if leaf and leaf not in names:
+            names.append(leaf)
+        if len(names) >= max_names:
             break
-    if not target:
-        return None
-
-    # Use \n for slicing; callers can normalize later.
-    lines = source.replace("\r\n", "\n").split("\n")
-    start = max(0, target.lineno - 1)
-    end = max(start, target.end_lineno)
-    return "\n".join(lines[start:end]).rstrip() + "\n"
+    return build_impact(str(root), src_text, names)
 
 
-def _build_plan_user(rel_path: str, source: str) -> str:
-    names = []
-    try:
-        names = [s.qname for s in extract_symbols(source)]
-    except Exception:
-        names = []
-    return (
-        f"Focus file: {rel_path}\n"
-        f"Top-level symbols (including methods):\n{json.dumps(names, ensure_ascii=False)}\n\n"
-        "Source:\n```python\n" + source + "\n```\n"
-    )
+def _meaningless_change(before: str, after: str) -> bool:
+    if before == after:
+        return True
+
+    # ignore whitespace-only changes
+    def norm(s: str) -> str:
+        return "\n".join(
+            [ln.strip() for ln in s.replace("\r\n", "\n").split("\n") if ln.strip()]
+        )
+
+    return norm(before) == norm(after)
 
 
-def _build_review_user(
-    rel_path: str, source: str, impact: dict[str, Any] | None
-) -> str:
-    parts: list[str] = [f"Path: {rel_path}"]
-    if impact:
-        parts.append("\nEvidence (deterministic, best-effort):")
-        if impact.get("imports"):
-            parts.append("\nImports:\n" + "\n".join(impact["imports"][:200]))
-        if impact.get("callsites"):
-            parts.append("\nCalls (sample):")
-            # keep small
-            for k, v in list((impact.get("callsites") or {}).items())[:30]:
-                if not v:
-                    continue
-                parts.append(f"\n- {k}:")
-                parts.extend(["  " + ln for ln in v[:5]])
-    parts.append("\nSource:\n```python\n" + source + "\n```\n")
-    return "\n".join(parts)
-
-
-def _build_edit_user(
-    rel_path: str,
-    source: str,
-    plan_obj: dict[str, Any] | None,
-    review_text: str | None,
-    impact: dict[str, Any] | None,
-    milestone: dict[str, Any] | None,
-) -> str:
-    parts: list[str] = [f"Focus file: {rel_path}"]
-    if milestone:
-        parts.append("\nApply ONLY this milestone (one pass):")
-        parts.append(json.dumps(milestone, ensure_ascii=False, indent=2))
-    elif plan_obj:
-        parts.append("\nPlan (first milestone preferred):")
-        parts.append(json.dumps(plan_obj, ensure_ascii=False, indent=2)[:8000])
-    if review_text:
-        # keep review small; take the top sections
-        parts.append("\nLatest review (excerpt):")
-        parts.append(review_text[:8000])
-    if impact:
-        parts.append("\nImpact evidence:")
-        parts.append(json.dumps(impact, ensure_ascii=False, indent=2)[:8000])
-    parts.append("\nSource:\n```python\n" + source + "\n```\n")
-    return "\n".join(parts)
-
-
-def _choose_milestone(
-    plan_obj: dict[str, Any] | None, done_ids: set[str]
-) -> dict[str, Any] | None:
-    if not plan_obj:
-        return None
-    ms = plan_obj.get("milestones")
-    if not isinstance(ms, list):
-        return None
-    for it in ms:
-        if not isinstance(it, dict):
-            continue
-        mid = str(it.get("id", "")).strip()
-        if mid and mid not in done_ids:
-            return it
-    return None
-
-
-def _safe_load_json_file(path: str) -> Any | None:
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def _write_skip_report(paths, task_id: str, rel_path: str, reason: str) -> None:
-    d = _artifact_dir(paths, task_id)
-    p = os.path.join(d, "final_report.md")
-    write_text(p, f"Path: {rel_path}\n\nStatus: SKIPPED\n\nReason: {reason}\n")
-
-
-def run_noctune(
-    mode: str,
+def _write_full_file_proposal(
     *,
     root: Path,
+    rel_path: str,
+    work_abs: str,
+    task_art: str,
+    llm: Optional[LLMClient],
+    verbose_llm: bool,
+    reason: str,
+) -> None:
+    """Last-resort: ask LLM for a full-file replacement and write proposed_full_file.py (checkpointed)."""
+    proposal_path = os.path.join(task_art, "proposed_full_file.py")
+    if os.path.exists(proposal_path):
+        return  # checkpoint: keep the first proposal
+
+    # If no LLM, still write something human-friendly.
+    if llm is None:
+        write_text(
+            proposal_path,
+            "# proposed_full_file.py was requested but LLM is disabled.\n"
+            f"# reason: {reason}\n",
+        )
+        return
+
+    cur = read_bytes(work_abs).decode("utf-8", errors="replace")
+    system = (
+        "You are a senior Python engineer.\n"
+        "Task: return a FULL corrected replacement for the focus file.\n"
+        "Rules:\n"
+        "- Output ONLY the full Python file content (no prose).\n"
+        "- Avoid sweeping refactors; minimize formatting churn.\n"
+        "- Fix syntax errors and obvious Ruff issues if possible.\n"
+    )
+    user = f"Path: {rel_path}\nReason: {reason}\n\nCurrent content:\n{cur}"
+
+    ok, out = llm.chat(
+        system=system,
+        user=user,
+        stream=True,
+        verbose=verbose_llm,
+        tag=f"fullfile:{rel_path}",
+    )
+    if not ok:
+        write_text(
+            proposal_path,
+            f"# LLM full-file proposal failed.\n# reason: {reason}\n",
+        )
+        write_text(os.path.join(task_art, "full_file_proposal_error.txt"), out + "\n")
+        return
+
+    # Strip a single fence wrapper if the model added one.
+    proposed = out.strip()
+    proposed = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", proposed)
+    proposed = re.sub(r"\s*```\s*$", "", proposed)
+
+    write_text(proposal_path, proposed.rstrip() + "\n")
+
+
+@dataclass
+class StageResult:
+    ok: bool
+    msg: str
+
+
+def run_stage(
+    *,
+    stage: str,  # plan|review|edit|repair|run
+    root: Path,
+    rel_paths: List[str],
     cfg: NoctuneConfig,
-    run_id: str | None = None,
-    files: Iterable[Path] | None = None,
-    file_list: Path | None = None,
-    max_files: int | None = None,
-    ruff_fix: bool = True,
-    llm_enabled: bool = True,
-    log_level: str = "INFO",
-    verbose_stream: bool | None = None,
+    run_id: Optional[str],
+    max_files: Optional[int],
+    ruff_fix_mode: str,  # safe|off
+    llm_enabled: bool,
+    log_level: str,
+    verbosity: int,
 ) -> int:
-    """Run Noctune in the given mode.
-
-    Modes:
-      - plan: generate plan artifacts only
-      - review: plan + impact + review
-      - edit: plan + impact + review + one edit/repair pass
-      - repair: attempt deterministic repair on current file state
-      - run: full flow; repeat edit+review passes until Label W or pass limit
-    """
-
-    root = root.resolve()
-    paths = ensure_run_paths(str(root), run_id)
-    log = EventLogger(os.path.join(paths.logs_dir, "events.jsonl"), level=log_level)
-
-    run_state_path = os.path.join(paths.state_dir, "run.json")
-    run_state = load_json(run_state_path, {})
-    if not run_state:
-        run_state = {
-            "schema_version": 1,
-            "run_id": paths.run_id,
-            "created_at": now_iso(),
-            "repo_root": str(root),
-            "interrupt_count": 0,
-            "current_file": None,
-        }
-        save_json(run_state_path, run_state)
-
-    scanner = RepoScanner.create(root)
-    if files is None:
-        if file_list is not None:
-            files = scanner.from_file_list(file_list)
-        else:
-            files = list(scanner.iter_python_files())
-    file_list2 = list(files)
-    if max_files:
-        file_list2 = file_list2[:max_files]
-
-    log.info(
-        event="run_start",
-        run_id=paths.run_id,
-        mode=mode,
-        file_count=len(file_list2),
-        ruff_fix=ruff_fix,
-        llm_enabled=llm_enabled,
+    rp = ensure_run_paths(str(root), run_id)
+    logger = EventLogger(
+        events_path=os.path.join(rp.logs_dir, "events.jsonl"), level=log_level
     )
 
+    # SQLite symbol index
+    db_path = os.path.join(rp.state_dir, "symbols.sqlite")
+
     # LLM
-    llm: LLMClient | None = None
-    if llm_enabled and cfg.llm.base_url:
+    llm: Optional[LLMClient] = None
+    if llm_enabled:
         llm = LLMClient(
             base_url=cfg.llm.base_url,
             api_key=cfg.llm.api_key or "",
             model=cfg.llm.model or "",
-            timeout_s=120,
+            timeout_s=180,
             extra_headers=cfg.llm.headers or {},
+            request_overrides=None,
+            mode="openai_chat",
             stream_default=bool(cfg.llm.stream),
             stream_print_reasoning=bool(cfg.llm.stream_print_reasoning),
             stream_print_headers=True,
         )
 
-    # Prompts are packaged resources.
-    plan_prompt = load_prompt(root, "plan.md")
-    review_prompt = load_prompt(root, "review.md")
-    edit_prompt = load_prompt(root, "edit.md")
-    repair_prompt = load_prompt(root, "repair.md")
+    verbose_llm = bool(cfg.llm.verbose_stream) or (verbosity > 0)
 
-    db_path = os.path.join(paths.state_dir, "symbols.sqlite")
+    interrupt_count = 0
+    processed = 0
 
-    # streaming verbosity: config default, optionally overridden
-    if verbose_stream is None:
-        verbose_stream = bool(cfg.llm.verbose_stream)
-
-    for abs_file in file_list2:
-        try:
-            rel_path = abs_file.resolve().relative_to(root).as_posix()
-        except Exception:
-            # skip files not under root
-            continue
-
-        task_id = _task_id_from_path(rel_path)
-        task_state_path = os.path.join(paths.state_dir, "tasks", task_id + ".json")
-        tstate = load_json(task_state_path, {})
-        if not tstate:
-            tstate = {
-                "schema_version": 1,
-                "task_id": task_id,
-                "path": rel_path,
-                "status": "pending",
-                "file_hash": None,
-                "label": None,
-                "pass_count": 0,
-                "milestones_done": [],
-                "human_notes": [],
-                "last_error": None,
-            }
-            save_json(task_state_path, tstate)
-
-        # Skip completed (W) if hash unchanged
-        b = read_bytes(str(abs_file))
-        fh = sha256_bytes(b)
-        if (
-            tstate.get("status") == "complete"
-            and tstate.get("label") == "W"
-            and tstate.get("file_hash") == fh
-        ):
-            log.info(event="skip_complete", task_id=task_id, path=rel_path)
-            continue
-
-        # Update run_state pointer
-        run_state["current_file"] = rel_path
-        save_json(run_state_path, run_state)
+    for rel_path in rel_paths:
+        if max_files is not None and processed >= max_files:
+            break
 
         try:
-            _process_one(
-                mode=mode,
-                root=root,
-                abs_file=abs_file,
-                rel_path=rel_path,
-                task_id=task_id,
-                task_state_path=task_state_path,
-                tstate=tstate,
-                paths=paths,
-                db_path=db_path,
-                log=log,
-                cfg=cfg,
-                llm=llm,
-                plan_prompt=plan_prompt,
-                review_prompt=review_prompt,
-                edit_prompt=edit_prompt,
-                repair_prompt=repair_prompt,
-                ruff_fix=ruff_fix,
-                verbose_stream=bool(verbose_stream),
-            )
-        except KeyboardInterrupt:
-            # Ctrl+C policy: 1 -> human note; 2 -> skip file; 3 -> terminate
-            run_state = load_json(run_state_path, {})
-            run_state["interrupt_count"] = int(run_state.get("interrupt_count", 0)) + 1
-            save_json(run_state_path, run_state)
-            ic = int(run_state["interrupt_count"])
-            log.warn(event="keyboard_interrupt", count=ic, current_file=rel_path)
-
-            if ic == 1:
-                note = input(
-                    "\n[Human support] Enter guidance for this file (empty to continue):\n> "
-                ).strip()
-                tstate = load_json(task_state_path, {})
-                if note:
-                    tstate.setdefault("human_notes", []).append(
-                        {"ts": now_iso(), "note": note}
-                    )
-                    save_json(task_state_path, tstate)
+            processed += 1
+            abs_path = (root / rel_path).resolve()
+            if not abs_path.exists():
+                logger.warn(event="file_missing", rel_path=rel_path)
                 continue
-            if ic == 2:
-                _write_skip_report(
-                    paths,
-                    task_id,
-                    rel_path,
-                    reason="Second KeyboardInterrupt; skipping file.",
+
+            task_id = _task_id(rel_path)
+            task_art = os.path.join(rp.artifacts_dir, task_id)
+            os.makedirs(task_art, exist_ok=True)
+
+            raw = read_bytes(str(abs_path))
+            newline = detect_newline_style(raw)
+            file_hash = sha256_bytes(raw)
+
+            task_state_path = os.path.join(rp.state_dir, "tasks", f"{task_id}.json")
+            task_state = load_json(task_state_path, default={})
+            prev_hash = task_state.get("file_hash")
+
+            # If review says W and hash unchanged -> skip
+            review_path = os.path.join(task_art, "review.md")
+            if os.path.exists(review_path) and prev_hash == file_hash:
+                try:
+                    lbl = _label_from_review(
+                        Path(review_path).read_text(encoding="utf-8", errors="replace")
+                    ) or task_state.get("label")
+                except Exception:
+                    lbl = task_state.get("label")
+                if lbl == "W":
+                    logger.info(event="skip_complete", rel_path=rel_path, label="W")
+                    continue
+
+            # Always keep backup snapshot
+            backup_path = os.path.join(rp.backups_dir, task_id + ".before.py")
+            if not os.path.exists(backup_path):
+                with open(backup_path, "wb") as f:
+                    f.write(raw)
+
+            # Work file path (temp)
+            work_abs = os.path.join(rp.work_dir, rel_path.replace("/", os.sep))
+            os.makedirs(os.path.dirname(work_abs), exist_ok=True)
+            with open(work_abs, "wb") as f:
+                f.write(raw)
+
+            # Index symbols for this file
+            try:
+                index_file(db_path, rel_path, raw.decode("utf-8", errors="replace"))
+            except Exception:
+                logger.warn(
+                    event="index_failed",
+                    rel_path=rel_path,
+                    error=traceback.format_exc()[:2000],
                 )
-                tstate = load_json(task_state_path, {})
-                tstate["status"] = "skipped"
-                save_json(task_state_path, tstate)
-                continue
-            # ic >= 3
-            log.error(event="terminate_on_interrupt", count=ic)
-            return 130
-        except Exception as e:
-            log.error(
-                event="file_crash",
-                task_id=task_id,
-                path=rel_path,
-                err=str(e),
-                tb=traceback.format_exc()[:4000],
-            )
-            tstate = load_json(task_state_path, {})
-            tstate["last_error"] = str(e)
-            tstate["status"] = "error"
-            save_json(task_state_path, tstate)
-            continue
 
-    log.info(event="run_end", run_id=paths.run_id)
+            # Dispatch by stage
+            if stage == "plan":
+                _do_plan(root, rel_path, raw, task_art, llm, verbose_llm, logger)
+            elif stage == "review":
+                _do_review(root, rel_path, raw, task_art, llm, verbose_llm, logger)
+            elif stage == "edit":
+                _do_edit(
+                    root=root,
+                    rel_path=rel_path,
+                    real_abs=str(abs_path),
+                    raw=raw,
+                    newline=newline,
+                    task_art=task_art,
+                    work_abs=work_abs,
+                    cfg=cfg,
+                    llm=llm,
+                    verbose_llm=verbose_llm,
+                    ruff_fix_mode=ruff_fix_mode,
+                    logger=logger,
+                )
+            elif stage == "repair":
+                _do_repair_only(
+                    root=root,
+                    rel_path=rel_path,
+                    real_abs=str(abs_path),
+                    raw=raw,
+                    newline=newline,
+                    task_art=task_art,
+                    work_abs=work_abs,
+                    cfg=cfg,
+                    llm=llm,
+                    verbose_llm=verbose_llm,
+                    ruff_fix_mode=ruff_fix_mode,
+                    logger=logger,
+                )
+            elif stage == "run":
+                _do_run_full(
+                    root=root,
+                    rel_path=rel_path,
+                    real_abs=str(abs_path),
+                    raw=raw,
+                    newline=newline,
+                    task_art=task_art,
+                    work_abs=work_abs,
+                    cfg=cfg,
+                    llm=llm,
+                    verbose_llm=verbose_llm,
+                    ruff_fix_mode=ruff_fix_mode,
+                    logger=logger,
+                )
+            else:
+                logger.error(event="bad_stage", stage=stage)
+                return 2
+
+            # Save state
+            # Refresh file after possible apply
+            try:
+                new_raw = read_bytes(str(abs_path))
+            except Exception:
+                new_raw = raw
+            task_state = {
+                "rel_path": rel_path,
+                "file_hash": sha256_bytes(new_raw),
+                "label": None,
+            }
+            if os.path.exists(review_path):
+                try:
+                    lbl = _label_from_review(
+                        Path(review_path).read_text(encoding="utf-8", errors="replace")
+                    )
+                    task_state["label"] = lbl
+                except Exception:
+                    pass
+            save_json(task_state_path, task_state)
+
+        except KeyboardInterrupt:
+            interrupt_count += 1
+            logger.warn(
+                event="keyboard_interrupt", count=interrupt_count, rel_path=rel_path
+            )
+            if interrupt_count == 1:
+                # Human note only on first interrupt (best-effort).
+                if os.isatty(0):
+                    try:
+                        note = input(
+                            "\nnoctune: interrupt received. Enter a short note (or empty to continue): "
+                        ).strip()
+                    except Exception:
+                        note = ""
+                else:
+                    note = ""
+                if note:
+                    write_text(
+                        os.path.join(
+                            rp.artifacts_dir, _task_id(rel_path), "human_note.txt"
+                        ),
+                        note + "\n",
+                    )
+                continue
+            if interrupt_count == 2:
+                # Skip current file
+                write_text(
+                    os.path.join(
+                        rp.artifacts_dir, _task_id(rel_path), "skipped_by_interrupt.txt"
+                    ),
+                    "skipped\n",
+                )
+                continue
+            # Third: terminate
+            return 130
+
     return 0
 
 
-def _process_one(
-    *,
-    mode: str,
+def _do_plan(
     root: Path,
-    abs_file: Path,
     rel_path: str,
-    task_id: str,
-    task_state_path: str,
-    tstate: dict[str, Any],
-    paths,
-    db_path: str,
-    log: EventLogger,
-    cfg: NoctuneConfig,
-    llm: LLMClient | None,
-    plan_prompt: str,
-    review_prompt: str,
-    edit_prompt: str,
-    repair_prompt: str,
-    ruff_fix: bool,
-    verbose_stream: bool,
+    raw: bytes,
+    task_art: str,
+    llm: Optional[LLMClient],
+    verbose_llm: bool,
+    logger: EventLogger,
 ) -> None:
-    d = _artifact_dir(paths, task_id)
-    abs_path = str(abs_file)
-
-    source, newline = _read_text_utf8(abs_path)
-    file_hash = sha256_bytes(read_bytes(abs_path))
-
-    tstate["status"] = "in_progress"
-    tstate["file_hash"] = file_hash
-    save_json(task_state_path, tstate)
-
-    # Index symbols (deterministic). Do not block on failures.
-    try:
-        syms = index_file(db_path, rel_path, source)
-        sym_names = [s.qname for s in syms]
-    except Exception:
-        sym_names = []
-
-    # PLAN
-    plan_path = os.path.join(d, "plan.json")
-    plan_obj: dict[str, Any] | None = None
+    if llm is None:
+        write_text(os.path.join(task_art, "plan.md"), "LLM disabled; skipping plan.\n")
+        return
+    plan_path = os.path.join(task_art, "plan.md")
     if os.path.exists(plan_path):
-        plan_obj = _safe_load_json_file(plan_path)
-    if plan_obj is None and mode in ("plan", "review", "edit", "repair", "run"):
-        if not llm:
-            write_text(
-                os.path.join(d, "plan_error.txt"),
-                "LLM disabled or missing base_url; cannot generate plan.\n",
-            )
-        else:
-            ok, out = llm.chat(
-                system=plan_prompt,
-                user=_build_plan_user(rel_path, source),
-                verbose=verbose_stream,
-                tag=f"plan:{rel_path}",
-            )
-            if ok:
-                raw = _strip_fences(out)
-                try:
-                    plan_obj = json.loads(raw)
-                    write_text(
-                        plan_path,
-                        json.dumps(plan_obj, indent=2, ensure_ascii=False) + "\n",
-                    )
-                except Exception as e:
-                    write_text(os.path.join(d, "plan_raw.txt"), out)
-                    write_text(
-                        os.path.join(d, "plan_error.txt"),
-                        f"Plan JSON parse failed: {e}\n",
-                    )
-            else:
-                write_text(os.path.join(d, "plan_error.txt"), out + "\n")
-
-    if mode == "plan":
-        tstate["status"] = "planned"
-        save_json(task_state_path, tstate)
         return
 
-    # IMPACT (deterministic)
-    impact_path = os.path.join(d, "impact.json")
-    impact_obj: dict[str, Any] | None = None
-    if os.path.exists(impact_path):
-        impact_obj = _safe_load_json_file(impact_path)
-    if impact_obj is None:
-        try:
-            impact = build_impact(str(root), source, sym_names[:200])
-            impact_obj = {
-                "imports": impact.imports,
-                "callsites": impact.callsites,
-            }
-            write_text(
-                impact_path, json.dumps(impact_obj, indent=2, ensure_ascii=False) + "\n"
-            )
-        except Exception as e:
-            impact_obj = {"error": str(e)}
-            write_text(
-                impact_path, json.dumps(impact_obj, indent=2, ensure_ascii=False) + "\n"
-            )
+    src_text = raw.decode("utf-8", errors="replace")
+    impact = _impact_pack(root, src_text, max_names=10)
 
-    # REVIEW
-    review_path = os.path.join(d, "review.md")
-    review_text: str | None = None
+    # Plan (free-form)
+    system = load_prompt(root, "plan.md")
+    user = (
+        f"Path: {rel_path}\n\nImports:\n"
+        + "\n".join(impact.imports[:60])
+        + "\n\nSource:\n"
+        + src_text
+    )
+    ok, out = llm.chat(
+        system=system,
+        user=user,
+        stream=True,
+        verbose=verbose_llm,
+        tag=f"plan:{rel_path}",
+    )
+    write_text(plan_path, out + "\n")
+    logger.info(event="plan_written", rel_path=rel_path, ok=ok)
+
+
+def _do_select(
+    root: Path,
+    rel_path: str,
+    raw: bytes,
+    task_art: str,
+    llm: Optional[LLMClient],
+    verbose_llm: bool,
+    logger: EventLogger,
+) -> None:
+    """Selection must be guided by the latest review; keep it as a distinct stage."""
+    sel_path = os.path.join(task_art, "selection.json")
+    if os.path.exists(sel_path):
+        return
+
+    if llm is None:
+        write_text(
+            sel_path, json.dumps({"file": rel_path, "targets": []}, indent=2) + "\n"
+        )
+        write_text(
+            os.path.join(task_art, "selection.raw.txt"),
+            "LLM disabled; skipping selection.\n",
+        )
+        return
+
+    src_text = raw.decode("utf-8", errors="replace")
+    impact = _impact_pack(root, src_text, max_names=10)
+
+    review_path = os.path.join(task_art, "review.md")
+    review_text = ""
     if os.path.exists(review_path):
         try:
             review_text = Path(review_path).read_text(
                 encoding="utf-8", errors="replace"
             )
         except Exception:
-            review_text = None
-    if review_text is None:
-        if not llm:
-            review_text = "Label: N\n\n(no LLM configured; review skipped)\n"
-            write_text(review_path, review_text)
-        else:
-            ok, out = llm.chat(
-                system=review_prompt,
-                user=_build_review_user(rel_path, source, impact_obj),
-                verbose=verbose_stream,
-                tag=f"review:{rel_path}",
-            )
-            review_text = out if ok else ("Label: N\n\n" + out)
-            write_text(review_path, review_text)
+            review_text = ""
 
-    label = _label_from_review(review_text or "")
-    if label:
-        tstate["label"] = label
-        save_json(task_state_path, tstate)
+    system = load_prompt(root, "select.md")
+    callsite_lines: list[str] = []
+    for k, hits in (impact.callsites or {}).items():
+        callsite_lines.append(f"## {k}")
+        callsite_lines.extend(hits[:30])
 
-    if label == "W":
-        tstate["status"] = "complete"
-        tstate["file_hash"] = sha256_bytes(read_bytes(abs_path))
-        save_json(task_state_path, tstate)
-        log.info(event="file_complete", task_id=task_id, path=rel_path)
+    user = (
+        f"Path: {rel_path}\n\n"
+        "You must choose targets based on the REVIEW objectives.\n\n"
+        "REVIEW (may be empty):\n"
+        + (review_text[:12000] if review_text else "(missing)\n")
+        + "\n\n"
+        "Evidence: imports and grep callsites (may be incomplete).\n\n"
+        "Imports:\n" + "\n".join(impact.imports[:80]) + "\n\n"
+        "Callsites:\n" + "\n".join(callsite_lines[:600]) + "\n\n"
+        "Source:\n" + src_text
+    )
+
+    ok, out = llm.chat(
+        system=system,
+        user=user,
+        stream=True,
+        verbose=verbose_llm,
+        tag=f"select:{rel_path}",
+    )
+    write_text(os.path.join(task_art, "selection.raw.txt"), out + "\n")
+    ok2, err, obj = _best_effort_json(out)
+    if not ok2 or not obj:
+        obj = {"file": rel_path, "targets": []}
+        write_text(os.path.join(task_art, "selection_parse_error.txt"), err + "\n")
+    write_text(sel_path, json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
+    logger.info(event="selection_written", rel_path=rel_path, ok=ok)
+
+
+def _do_review(
+    root: Path,
+    rel_path: str,
+    raw: bytes,
+    task_art: str,
+    llm: Optional[LLMClient],
+    verbose_llm: bool,
+    logger: EventLogger,
+) -> None:
+    review_path = os.path.join(task_art, "review.md")
+    if os.path.exists(review_path):
         return
-
-    if mode == "review":
-        tstate["status"] = "reviewed"
-        save_json(task_state_path, tstate)
-        return
-
-    # REPAIR-only mode: do not generate edits; attempt to clean the current file.
-    if mode == "repair":
-        _repair_current_file(
-            abs_path=abs_path,
-            rel_path=rel_path,
-            task_id=task_id,
-            paths=paths,
-            newline=newline,
-            llm=llm,
-            repair_prompt=repair_prompt,
-            verbose_stream=verbose_stream,
-            ruff_fix=ruff_fix,
-            log=log,
-            d=d,
-        )
-        tstate["status"] = "repaired"
-        tstate["file_hash"] = sha256_bytes(read_bytes(abs_path))
-        save_json(task_state_path, tstate)
-        return
-
-    # EDIT / RUN
-    if not llm:
+    if llm is None:
         write_text(
-            os.path.join(d, "final_report.md"),
-            f"Path: {rel_path}\n\nStatus: NEEDS_HUMAN\n\nReason: LLM disabled or missing base_url; cannot edit.\n",
+            review_path, "Score: 0/100\nLabel: N\n\nLLM disabled; skipping review.\n"
         )
-        tstate["status"] = "needs_human"
-        save_json(task_state_path, tstate)
+        return
+    src_text = raw.decode("utf-8", errors="replace")
+    impact = _impact_pack(root, src_text, max_names=10)
+    system = load_prompt(root, "review.md")
+    callsite_lines = []
+    for k, hits in (impact.callsites or {}).items():
+        callsite_lines.append(f"## {k}")
+        callsite_lines.extend(hits[:30])
+    user = (
+        f"Path: {rel_path}\n\n"
+        "Evidence (imports + grep callsites):\n\n"
+        "Imports:\n" + "\n".join(impact.imports[:80]) + "\n\n"
+        "Callsites:\n" + "\n".join(callsite_lines[:600]) + "\n\n"
+        "Source:\n" + src_text
+    )
+    ok, out = llm.chat(
+        system=system,
+        user=user,
+        stream=True,
+        verbose=verbose_llm,
+        tag=f"review:{rel_path}",
+    )
+    write_text(review_path, out + "\n")
+    logger.info(
+        event="review_written", rel_path=rel_path, ok=ok, label=_label_from_review(out)
+    )
+
+
+def _do_edit(
+    *,
+    root: Path,
+    rel_path: str,
+    real_abs: str,
+    raw: bytes,
+    newline: str,
+    task_art: str,
+    work_abs: str,
+    cfg: NoctuneConfig,
+    llm: Optional[LLMClient],
+    verbose_llm: bool,
+    ruff_fix_mode: str,
+    logger: EventLogger,
+) -> None:
+    if llm is None:
+        write_text(
+            os.path.join(task_art, "edit_skipped.txt"), "LLM disabled; skipping edit.\n"
+        )
         return
 
-    done_ids = set([str(x) for x in (tstate.get("milestones_done") or [])])
-    passes = int(tstate.get("pass_count") or 0)
+    # Edit is allowed as a standalone task. If prerequisites are missing, create them.
+    plan_path = os.path.join(task_art, "plan.md")
+    if not os.path.exists(plan_path):
+        _do_plan(root, rel_path, raw, task_art, llm, verbose_llm, logger)
 
-    # In edit mode, do exactly one pass. In run mode, loop with a ceiling.
-    pass_budget = 1 if mode == "edit" else max(1, MAX_PASSES_PER_FILE - passes)
-    while pass_budget > 0:
-        pass_budget -= 1
-        passes = int(tstate.get("pass_count") or 0) + 1
-        tstate["pass_count"] = passes
-        save_json(task_state_path, tstate)
+    review_path = os.path.join(task_art, "review.md")
+    if not os.path.exists(review_path):
+        _do_review(root, rel_path, raw, task_art, llm, verbose_llm, logger)
 
-        # Refresh from disk each pass
-        source, newline = _read_text_utf8(abs_path)
-        file_hash = sha256_bytes(read_bytes(abs_path))
-        tstate["file_hash"] = file_hash
-        save_json(task_state_path, tstate)
+    sel_path = os.path.join(task_art, "selection.json")
+    # Selection must track the latest review; if review is newer, regenerate selection.
+    try:
+        if os.path.exists(sel_path) and os.path.exists(review_path):
+            if os.path.getmtime(review_path) > os.path.getmtime(sel_path):
+                os.remove(sel_path)
+    except Exception:
+        pass
+    if not os.path.exists(sel_path):
+        _do_select(root, rel_path, raw, task_art, llm, verbose_llm, logger)
 
-        milestone = _choose_milestone(plan_obj, done_ids)
-        if milestone and milestone.get("id"):
-            cur_ms_id = str(milestone.get("id"))
-        else:
-            cur_ms_id = ""
+    selection = load_json(sel_path, default={})
+    targets = selection.get("targets", []) or []
+    if not isinstance(targets, list):
+        targets = []
+    if not targets:
+        write_text(
+            os.path.join(task_art, "edit_no_targets.txt"), "No targets selected.\n"
+        )
+        return
 
-        user = _build_edit_user(
-            rel_path=rel_path,
-            source=source,
-            plan_obj=plan_obj,
-            review_text=review_text,
-            impact=impact_obj,
-            milestone=milestone,
+    # Real and temp start aligned
+    real_bytes = read_bytes(real_abs)
+    temp_bytes = read_bytes(work_abs)
+
+    # Ensure we edit on temp first
+    if temp_bytes != real_bytes:
+        temp_bytes = real_bytes
+        with open(work_abs, "wb") as f:
+            f.write(temp_bytes)
+
+    src_text = real_bytes.decode("utf-8", errors="replace")
+    syms = extract_symbols(src_text)
+    sym_map = {s.qname: s for s in syms}
+
+    any_approved = False
+
+    for t in targets[:3]:
+        qname = str(t.get("qname", "")).strip()
+        if not qname or qname not in sym_map:
+            continue
+        spec = t.get("change_spec", [])
+        if not isinstance(spec, list):
+            spec = [str(spec)]
+
+        # BEFORE from current real_bytes (may change as we apply)
+        cur_real_text = real_bytes.decode("utf-8", errors="replace")
+        cur_syms = extract_symbols(cur_real_text)
+        cur_map = {s.qname: s for s in cur_syms}
+        if qname not in cur_map:
+            continue
+        before_code = _extract_symbol_source(cur_real_text, cur_map[qname])
+
+        # Edit attempt (single pass + optional repair)
+        system = load_prompt(root, "edit.md")
+        user = (
+            f"Path: {rel_path}\nQname: {qname}\n\n"
+            "Current symbol code:\n" + before_code + "\n\n"
+            "Change spec:\n- " + "\n- ".join([str(x) for x in spec][:30]) + "\n"
         )
         ok, out = llm.chat(
-            system=edit_prompt,
+            system=system,
             user=user,
-            verbose=verbose_stream,
-            tag=f"edit:{rel_path}:p{passes}",
+            stream=True,
+            verbose=verbose_llm,
+            tag=f"edit:{qname}",
         )
-        write_text(os.path.join(d, f"edit_raw_p{passes}.txt"), out)
-        if not ok:
-            write_text(
-                os.path.join(d, "final_report.md"),
-                f"Path: {rel_path}\n\nStatus: NEEDS_HUMAN\n\nLLM edit failed:\n{out}\n",
-            )
-            tstate["status"] = "needs_human"
-            tstate["last_error"] = "llm_edit_failed"
-            save_json(task_state_path, tstate)
-            return
-
-        ok_ops, err, ops = parse_edit_ops(out)
-        if not ok_ops:
-            write_text(
-                os.path.join(d, "final_report.md"),
-                f"Path: {rel_path}\n\nStatus: NEEDS_HUMAN\n\nCould not parse edit ops JSON: {err}\n",
-            )
-            tstate["status"] = "needs_human"
-            tstate["last_error"] = f"edit_ops_parse_failed: {err}"
-            save_json(task_state_path, tstate)
-            return
         write_text(
-            os.path.join(d, f"edit_ops_p{passes}.json"),
-            json.dumps([op.__dict__ for op in ops], indent=2, ensure_ascii=False)
-            + "\n",
+            os.path.join(task_art, f"edit_{_task_id(qname)}.raw.txt"), out + "\n"
         )
-
-        # Backup current file bytes before applying
-        backup_name = f"p{passes}__{_task_id_from_path(rel_path)}.before.py"
-        backup_path = os.path.join(paths.backups_dir, task_id, backup_name)
-        os.makedirs(os.path.dirname(backup_path), exist_ok=True)
-        with open(backup_path, "wb") as f:
-            f.write(read_bytes(abs_path))
-
-        changed: list[str] = []
-        updated_source = source
-        # Apply replace_symbol ops only (v0). Others are recorded as skipped.
-        skipped_ops: list[dict[str, Any]] = []
-        for op in ops:
-            if op.op != "replace_symbol":
-                skipped_ops.append(
-                    {"op": op.op, "qname": op.qname, "reason": "unsupported_in_v0"}
-                )
-                continue
-            if not op.qname or not op.new_code:
-                skipped_ops.append(
-                    {
-                        "op": op.op,
-                        "qname": op.qname,
-                        "reason": "missing_qname_or_new_code",
-                    }
-                )
-                continue
-            res = apply_replace_symbol(
-                rel_path, updated_source.encode("utf-8"), op.qname, op.new_code
+        ok2, err, obj = _best_effort_json(out)
+        if not ok2 or not obj:
+            write_text(
+                os.path.join(task_art, f"edit_{_task_id(qname)}.parse_error.txt"),
+                err + "\n",
             )
-            if not res.ok:
-                skipped_ops.append({"op": op.op, "qname": op.qname, "reason": res.msg})
-                continue
-            updated_source = res.updated_source
-            changed.extend(res.changed_qnames)
-
-        # Write apply report now (even if nothing applied)
-        apply_report = {
-            "path": rel_path,
-            "pass": passes,
-            "changed_qnames": changed,
-            "skipped_ops": skipped_ops,
-        }
-        write_text(
-            os.path.join(d, f"apply_report_p{passes}.json"),
-            json.dumps(apply_report, indent=2, ensure_ascii=False) + "\n",
-        )
-
-        if not changed:
-            # Nothing applied; mark milestone as done to avoid infinite loops if it keeps asking for unsupported ops.
-            if cur_ms_id:
-                done_ids.add(cur_ms_id)
-                tstate.setdefault("milestones_done", []).append(cur_ms_id)
-                save_json(task_state_path, tstate)
-            if mode == "edit":
-                tstate["status"] = "no_changes"
-                save_json(task_state_path, tstate)
-                return
-            # In run mode, re-review and continue (maybe plan was weak)
-            review_text = None
-            if os.path.exists(review_path):
-                os.remove(review_path)
+            continue
+        new_code = str(obj.get("code", ""))
+        if not new_code.strip():
             continue
 
-        # Apply to disk (caller has already gated permission in CLI).
-        _write_bytes_preserve_newline(abs_path, updated_source, newline)
-
-        # Gates + repair loop
-        gate_ok = _gates_and_repair(
-            abs_path=abs_path,
-            rel_path=rel_path,
-            newline=newline,
-            changed_qnames=changed,
-            d=d,
-            llm=llm,
-            repair_prompt=repair_prompt,
-            verbose_stream=verbose_stream,
-            ruff_fix=ruff_fix,
-        )
-        if not gate_ok:
-            # Last-resort: write a full-file proposal artifact.
-            # IMPORTANT: do not leave a broken file in the repo; restore the backup.
-            _write_full_file_proposal(
-                abs_path=abs_path,
-                rel_path=rel_path,
-                d=d,
-                llm=llm,
-                verbose_stream=verbose_stream,
-            )
-            try:
-                with open(backup_path, "rb") as f:
-                    orig = f.read()
-                with open(abs_path, "wb") as f:
-                    f.write(orig)
-                write_text(
-                    os.path.join(d, "restore_note.txt"),
-                    "Gate(s) failed after apply; restored the pre-apply backup.\n",
-                )
-            except Exception:
-                # If restore fails, keep going but surface it in logs.
-                log.warn(event="restore_failed", task_id=task_id, path=rel_path)
-            tstate["status"] = "needs_human"
-            tstate["last_error"] = "gates_failed"
-            tstate["file_hash"] = sha256_bytes(read_bytes(abs_path))
-            save_json(task_state_path, tstate)
-            return
-
-        # Mark milestone done if we had one
-        if cur_ms_id:
-            done_ids.add(cur_ms_id)
-            tstate.setdefault("milestones_done", []).append(cur_ms_id)
-            save_json(task_state_path, tstate)
-
-        # Re-review after successful pass
-        review_text = None
-        if os.path.exists(review_path):
-            os.remove(review_path)
-        # loop back to top of while; next iteration will regenerate review
-
-        # Force review regeneration now
-        source, _ = _read_text_utf8(abs_path)
-        ok_r, out_r = llm.chat(
-            system=review_prompt,
-            user=_build_review_user(rel_path, source, impact_obj),
-            verbose=verbose_stream,
-            tag=f"review:{rel_path}:p{passes}",
-        )
-        review_text = out_r if ok_r else ("Label: N\n\n" + out_r)
-        write_text(review_path, review_text)
-        label = _label_from_review(review_text)
-        if label:
-            tstate["label"] = label
-            save_json(task_state_path, tstate)
-        if label == "W":
-            tstate["status"] = "complete"
-            tstate["file_hash"] = sha256_bytes(read_bytes(abs_path))
-            save_json(task_state_path, tstate)
-            log.info(event="file_complete", task_id=task_id, path=rel_path)
-            return
-
-        if mode == "edit":
-            tstate["status"] = "edited"
-            tstate["file_hash"] = sha256_bytes(read_bytes(abs_path))
-            save_json(task_state_path, tstate)
-            return
-
-    # If we ran out of pass budget
-    tstate["status"] = "incomplete"
-    tstate["file_hash"] = sha256_bytes(read_bytes(abs_path))
-    save_json(task_state_path, tstate)
-
-
-def _gates_and_repair(
-    *,
-    abs_path: str,
-    rel_path: str,
-    newline: str,
-    changed_qnames: list[str],
-    d: str,
-    llm: LLMClient,
-    repair_prompt: str,
-    verbose_stream: bool,
-    ruff_fix: bool,
-) -> bool:
-    # Parse gate
-    source, _nl = _read_text_utf8(abs_path)
-    ok_parse, parse_err = check_parse(source)
-    if not ok_parse:
-        # Heuristic cleanup on whole file
-        cleaned = heuristic_basic(source)
-        ok_parse2, parse_err2 = check_parse(cleaned)
-        if ok_parse2:
-            _write_bytes_preserve_newline(abs_path, cleaned, newline)
-            source = cleaned
-            ok_parse, parse_err = True, None
-        else:
+        # Pre-check: meaningless change
+        if _meaningless_change(before_code, new_code):
             write_text(
-                os.path.join(d, "gate_parse_error.txt"),
-                f"{parse_err}\n{parse_err2 or ''}\n",
+                os.path.join(
+                    task_art, f"edit_{_task_id(qname)}.rejected_meaningless.txt"
+                ),
+                "meaningsless\n",
             )
-            # Try micro-LLM repairs on changed symbols (best-effort)
-            if changed_qnames:
-                ok_repair = _micro_repair_symbols(
-                    abs_path=abs_path,
-                    rel_path=rel_path,
-                    newline=newline,
-                    qnames=changed_qnames,
-                    d=d,
+            continue
+
+        # Apply to temp
+        prev_temp = temp_bytes
+        ar = apply_replace_symbol(
+            rel_path=rel_path,
+            original_bytes=temp_bytes,
+            op_qname=qname,
+            new_code=new_code,
+        )
+        if not ar.ok:
+            write_text(
+                os.path.join(task_art, f"apply_{_task_id(qname)}.error.txt"),
+                ar.msg + "\n",
+            )
+            continue
+        temp_text = ar.updated_source
+        temp_bytes = temp_text.encode("utf-8")
+        with open(work_abs, "wb") as f:
+            f.write(temp_bytes)
+
+        # Heuristic trim + tabs before gates
+        temp_text2 = heuristic_basic(temp_text)
+        if temp_text2 != temp_text:
+            temp_bytes = temp_text2.encode("utf-8")
+            with open(work_abs, "wb") as f:
+                f.write(temp_bytes)
+
+        # Gates on temp
+        parse_ok, parse_err = check_parse(work_abs)
+        ruff_ok, ruff_out, ruff_err = check_ruff(work_abs)
+        if (not parse_ok) or (not ruff_ok):
+            # Optional safe ruff fix
+            if ruff_fix_mode == "safe":
+                ruff_fix_safe(work_abs)
+                parse_ok, parse_err = check_parse(work_abs)
+                ruff_ok, ruff_out, ruff_err = check_ruff(work_abs)
+
+        if (not parse_ok) or (not ruff_ok):
+            # Micro-LLM repair on symbol only (one attempt)
+            diag = ""
+            if not parse_ok:
+                diag += f"SyntaxError: {parse_err}\n"
+            if not ruff_ok:
+                diag += (
+                    json.dumps(ruff_out, ensure_ascii=False)
+                    if not isinstance(ruff_out, str)
+                    else ruff_out
+                )[:2000]
+                diag += "\n"
+                diag += (
+                    json.dumps(ruff_err, ensure_ascii=False)
+                    if not isinstance(ruff_err, str)
+                    else ruff_err
+                )[:2000]
+
+            # extract current symbol from temp and repair it
+            temp_current_text = read_bytes(work_abs).decode("utf-8", errors="replace")
+            temp_syms2 = extract_symbols(temp_current_text)
+            temp_map2 = {s.qname: s for s in temp_syms2}
+            if qname in temp_map2:
+                bad_code = _extract_symbol_source(temp_current_text, temp_map2[qname])
+                rep_prompt = load_prompt(root, "repair.md")
+                okr, fixed = micro_llm_repair(
                     llm=llm,
-                    repair_prompt=repair_prompt,
-                    diagnostics=parse_err2 or parse_err or "parse failed",
-                    verbose_stream=verbose_stream,
+                    repair_prompt=rep_prompt,
+                    diagnostics=diag,
+                    symbol_code=bad_code,
+                    verbose=verbose_llm,
+                    tag=f"repair:{qname}",
                 )
-                if ok_repair:
-                    source, _ = _read_text_utf8(abs_path)
-                    ok_parse, parse_err = check_parse(source)
-            if not ok_parse:
-                write_text(
-                    os.path.join(d, "final_report.md"),
-                    f"Path: {rel_path}\n\nStatus: NEEDS_HUMAN\n\nParse gate failed:\n{parse_err}\n",
-                )
-                return False
+                if okr and fixed.strip():
+                    ar2 = apply_replace_symbol(
+                        rel_path=rel_path,
+                        original_bytes=read_bytes(work_abs),
+                        op_qname=qname,
+                        new_code=fixed,
+                    )
+                    if ar2.ok:
+                        temp_bytes = ar2.updated_source.encode("utf-8")
+                        with open(work_abs, "wb") as f:
+                            f.write(temp_bytes)
+                        # re-run gates
+                        parse_ok, parse_err = check_parse(work_abs)
+                        ruff_ok, ruff_out, ruff_err = check_ruff(work_abs)
 
-    # Ruff gate
-    ok_ruff, ruff_json, ruff_stderr = check_ruff(abs_path)
-    if not ok_ruff and ruff_fix:
-        ruff_fix_safe(abs_path)
-        # re-check after fix
-        ok_ruff, ruff_json, ruff_stderr = check_ruff(abs_path)
-
-    if not ok_ruff:
-        # Try micro-LLM repair on changed symbols
-        diag = (
-            json.dumps(ruff_json, ensure_ascii=False)[:4000]
-            if ruff_json is not None
-            else (ruff_stderr or "ruff failed")
-        )
-        ok_repair = _micro_repair_symbols(
-            abs_path=abs_path,
-            rel_path=rel_path,
-            newline=newline,
-            qnames=changed_qnames,
-            d=d,
-            llm=llm,
-            repair_prompt=repair_prompt,
-            diagnostics=diag,
-            verbose_stream=verbose_stream,
-        )
-        if ok_repair:
-            ok_ruff, ruff_json, ruff_stderr = check_ruff(abs_path)
-
-    if not ok_ruff:
-        write_text(
-            os.path.join(d, "gate_ruff_error.json"),
-            json.dumps(
-                {"ruff": ruff_json, "stderr": ruff_stderr}, indent=2, ensure_ascii=False
+        if (not parse_ok) or (not ruff_ok):
+            _write_full_file_proposal(
+                root=root,
+                rel_path=rel_path,
+                work_abs=work_abs,
+                task_art=task_art,
+                llm=llm,
+                verbose_llm=verbose_llm,
+                reason=f"edit gate failed for {qname}: parse_ok={parse_ok}, ruff_ok={ruff_ok}",
             )
-            + "\n",
-        )
-        write_text(
-            os.path.join(d, "final_report.md"),
-            f"Path: {rel_path}\n\nStatus: NEEDS_HUMAN\n\nRuff gate failed.\n",
-        )
-        return False
 
-    return True
-
-
-def _micro_repair_symbols(
-    *,
-    abs_path: str,
-    rel_path: str,
-    newline: str,
-    qnames: list[str],
-    d: str,
-    llm: LLMClient,
-    repair_prompt: str,
-    diagnostics: str,
-    verbose_stream: bool,
-) -> bool:
-    # Two rounds max.
-    for round_i in range(2):
-        made_change = False
-        source, _ = _read_text_utf8(abs_path)
-        for qn in qnames:
-            sym_code = _extract_symbol_code(source, qn)
-            if not sym_code:
-                continue
-            ok, fixed = micro_llm_repair(
-                llm,
-                repair_prompt,
-                symbol_code=sym_code,
-                diagnostics=diagnostics,
-                verbose=verbose_stream,
-                tag=f"repair:{rel_path}:{qn}:r{round_i + 1}",
-            )
-            if not ok:
-                continue
-            # Apply repaired symbol
-            res = apply_replace_symbol(rel_path, source.encode("utf-8"), qn, fixed)
-            if res.ok:
-                _write_bytes_preserve_newline(abs_path, res.updated_source, newline)
-                made_change = True
-                source = res.updated_source
-        if not made_change:
-            return False
-        # Re-check parse after each round
-        source2, _ = _read_text_utf8(abs_path)
-        ok_parse, _err = check_parse(source2)
-        if not ok_parse:
-            continue
-        return True
-    return False
-
-
-def _write_full_file_proposal(
-    *,
-    abs_path: str,
-    rel_path: str,
-    d: str,
-    llm: LLMClient,
-    verbose_stream: bool,
-) -> None:
-    # Always produce a human-friendly proposal file on last-resort failure.
-    source, _nl = _read_text_utf8(abs_path)
-    proposal_path = os.path.join(d, "proposed_full_file.py")
-    # If we already have a proposal, keep it (checkpoint).
-    if os.path.exists(proposal_path):
-        return
-
-    sys_prompt = (
-        "You are a senior Python engineer.\n\n"
-        "Task: return a FULL corrected replacement for the focus file.\n"
-        "Rules:\n"
-        "- Output ONLY the full Python file content (no prose, no fences).\n"
-        "- Minimize formatting churn where possible.\n"
-        "- Fix syntax errors and obvious Ruff issues if you can.\n"
-    )
-    user = f"Focus file: {rel_path}\n\nCurrent content:\n" + source
-    ok, out = llm.chat(
-        system=sys_prompt,
-        user=user,
-        verbose=verbose_stream,
-        tag=f"fullfile:{rel_path}",
-    )
-    if not ok:
-        write_text(proposal_path, "# LLM full-file proposal failed\n")
-        write_text(os.path.join(d, "full_file_proposal_error.txt"), out + "\n")
-        return
-    proposed = _strip_fences(out)
-    write_text(proposal_path, proposed.rstrip() + "\n")
-
-
-def _repair_current_file(
-    *,
-    abs_path: str,
-    rel_path: str,
-    task_id: str,
-    paths,
-    newline: str,
-    llm: LLMClient | None,
-    repair_prompt: str,
-    verbose_stream: bool,
-    ruff_fix: bool,
-    log: EventLogger,
-    d: str,
-) -> None:
-    source, _ = _read_text_utf8(abs_path)
-    ok_parse, perr = check_parse(source)
-    if not ok_parse:
-        cleaned = heuristic_basic(source)
-        ok2, perr2 = check_parse(cleaned)
-        if ok2:
-            _write_bytes_preserve_newline(abs_path, cleaned, newline)
-            source = cleaned
-        else:
+            # revert temp, record report
+            temp_bytes = prev_temp
+            with open(work_abs, "wb") as f:
+                f.write(temp_bytes)
             write_text(
-                os.path.join(d, "gate_parse_error.txt"), f"{perr}\n{perr2 or ''}\n"
+                os.path.join(task_art, f"gate_fail_{_task_id(qname)}.txt"),
+                f"parse_ok={parse_ok} ruff_ok={ruff_ok}\n{parse_err or ''}\n{ruff_out or ''}\n{ruff_err or ''}\n",
             )
+            continue
 
-    ok_ruff, ruff_json, ruff_stderr = check_ruff(abs_path)
-    if not ok_ruff and ruff_fix:
-        ruff_fix_safe(abs_path)
-        ok_ruff, ruff_json, ruff_stderr = check_ruff(abs_path)
+        # Approver (LLM)
+        # AFTER symbol code from temp
+        temp_final_text = read_bytes(work_abs).decode("utf-8", errors="replace")
+        temp_syms3 = extract_symbols(temp_final_text)
+        temp_map3 = {s.qname: s for s in temp_syms3}
+        after_code = (
+            _extract_symbol_source(
+                temp_final_text, temp_map3.get(qname, cur_map[qname])
+            )
+            if temp_map3
+            else new_code
+        )
 
-    if ok_ruff:
-        return
-
-    # If still failing, try micro repair based on last edit ops if available.
-    if not llm:
+        approve_system = load_prompt(root, "approve.md")
+        intent = str(t.get("intent", "")).strip()
+        spec_summary = "- " + "\n- ".join([str(x) for x in spec][:30])
+        gate_summary = "parse_ok=True\nruff_ok=True\n"
+        user2 = (
+            f"Path: {rel_path}\nQname: {qname}\n\n"
+            f"Selector intent: {intent}\n\n"
+            f"Change spec:\n{spec_summary}\n\n"
+            f"Gate summary:\n{gate_summary}\n"
+            "BEFORE:\n" + before_code + "\n\n"
+            "AFTER:\n" + after_code + "\n"
+        )
+        ok_a, out_a = llm.chat(
+            system=approve_system,
+            user=user2,
+            stream=True,
+            verbose=verbose_llm,
+            tag=f"approve:{qname}",
+        )
         write_text(
-            os.path.join(d, "final_report.md"),
-            f"Path: {rel_path}\n\nStatus: NEEDS_HUMAN\n\nRepair requested, but LLM is not configured.\n",
+            os.path.join(task_art, f"approve_{_task_id(qname)}.txt"), out_a + "\n"
         )
+        decision = (out_a.strip().splitlines()[:1] or [""])[0].strip().upper()
+        if decision != "APPROVE":
+            # revert temp
+            temp_bytes = prev_temp
+            with open(work_abs, "wb") as f:
+                f.write(temp_bytes)
+            write_text(
+                os.path.join(task_art, f"rejected_{_task_id(qname)}.txt"),
+                out_a.strip()[:4000] + "\n",
+            )
+            continue
+
+        any_approved = True
+
+        # Apply to real only if allowed
+        if cfg.allow_apply:
+            ar_real = apply_replace_symbol(
+                rel_path=rel_path,
+                original_bytes=real_bytes,
+                op_qname=qname,
+                new_code=after_code,
+            )
+            if ar_real.ok:
+                real_bytes = ar_real.updated_source.encode("utf-8")
+                with open(real_abs, "wb") as f:
+                    f.write(real_bytes)
+                logger.info(event="applied", rel_path=rel_path, qname=qname)
+            else:
+                logger.warn(
+                    event="apply_real_failed",
+                    rel_path=rel_path,
+                    qname=qname,
+                    msg=ar_real.msg,
+                )
+
+        # Sync temp with real after approval (so later edits stack cleanly)
+        temp_bytes = real_bytes
+        with open(work_abs, "wb") as f:
+            f.write(temp_bytes)
+
+    if not any_approved:
+        write_text(
+            os.path.join(task_art, "edit_no_approvals.txt"),
+            "No symbol changes were approved.\n",
+        )
+
+
+def _do_repair_only(
+    *,
+    root: Path,
+    rel_path: str,
+    real_abs: str,
+    raw: bytes,
+    newline: str,
+    task_art: str,
+    work_abs: str,
+    cfg: NoctuneConfig,
+    llm: Optional[LLMClient],
+    verbose_llm: bool,
+    ruff_fix_mode: str,
+    logger: EventLogger,
+) -> None:
+    # Repair-only: run gates; if failing, apply heuristic + optional ruff --fix; do not use editor/approver.
+    with open(work_abs, "wb") as f:
+        f.write(raw)
+    parse_ok, parse_err = check_parse(work_abs)
+    ruff_ok, ruff_out, ruff_err = check_ruff(work_abs)
+    if (not parse_ok) or (not ruff_ok):
+        _write_full_file_proposal(
+            root=root,
+            rel_path=rel_path,
+            work_abs=work_abs,
+            task_art=task_art,
+            llm=llm,
+            verbose_llm=verbose_llm,
+            reason=f"repair-only gate failed: parse_ok={parse_ok}, ruff_ok={ruff_ok}",
+        )
+        # Do not apply to real; leave artifacts for human/codex.
         return
 
-    # Find most recent ops file in artifacts
-    qnames: list[str] = []
-    for p in sorted(Path(d).glob("edit_ops_p*.json"), reverse=True):
-        obj = _safe_load_json_file(str(p))
-        if isinstance(obj, list):
-            for it in obj:
-                if isinstance(it, dict) and it.get("qname"):
-                    qnames.append(str(it["qname"]))
-        if qnames:
-            break
-    qnames = list(dict.fromkeys(qnames))[:30]
-    diag = (
-        json.dumps(ruff_json, ensure_ascii=False)[:4000]
-        if ruff_json is not None
-        else (ruff_stderr or "ruff failed")
+    write_text(
+        os.path.join(task_art, "repair_gates.txt"),
+        f"parse_ok={parse_ok}\nruff_ok={ruff_ok}\n{parse_err or ''}\n{ruff_out or ''}\n{ruff_err or ''}\n",
     )
 
-    if not qnames:
-        # No symbol hints; write proposal and return.
-        _write_full_file_proposal(
-            abs_path=abs_path,
-            rel_path=rel_path,
-            d=d,
-            llm=llm,
-            verbose_stream=verbose_stream,
-        )
-        return
+    # Apply repaired temp to real only if allow_apply and now clean
+    if cfg.allow_apply and parse_ok and ruff_ok:
+        repaired = read_bytes(work_abs)
+        with open(real_abs, "wb") as f:
+            f.write(repaired)
 
-    ok_repair = _micro_repair_symbols(
-        abs_path=abs_path,
-        rel_path=rel_path,
-        newline=newline,
-        qnames=qnames,
-        d=d,
-        llm=llm,
-        repair_prompt=repair_prompt,
-        diagnostics=diag,
-        verbose_stream=verbose_stream,
-    )
-    if not ok_repair:
-        _write_full_file_proposal(
-            abs_path=abs_path,
-            rel_path=rel_path,
-            d=d,
-            llm=llm,
-            verbose_stream=verbose_stream,
+
+def _do_run_full(
+    *,
+    root: Path,
+    rel_path: str,
+    real_abs: str,
+    raw: bytes,
+    newline: str,
+    task_art: str,
+    work_abs: str,
+    cfg: NoctuneConfig,
+    llm: Optional[LLMClient],
+    verbose_llm: bool,
+    ruff_fix_mode: str,
+    logger: EventLogger,
+) -> None:
+    # Full loop: plan -> review -> select -> edit -> approve; then repeat review/select/edit as needed.
+    max_passes = 3
+    for p in range(max_passes):
+        _do_plan(
+            root, rel_path, read_bytes(real_abs), task_art, llm, verbose_llm, logger
         )
-        return
+        _do_review(
+            root, rel_path, read_bytes(real_abs), task_art, llm, verbose_llm, logger
+        )
+        review_text = Path(os.path.join(task_art, "review.md")).read_text(
+            encoding="utf-8", errors="replace"
+        )
+        lbl = _label_from_review(review_text)
+        if lbl == "W":
+            return
+
+        # Selection is review-guided; regenerate each pass.
+        sel_path = os.path.join(task_art, "selection.json")
+        try:
+            if os.path.exists(sel_path):
+                os.remove(sel_path)
+        except Exception:
+            pass
+        _do_select(
+            root, rel_path, read_bytes(real_abs), task_art, llm, verbose_llm, logger
+        )
+
+        _do_edit(
+            root=root,
+            rel_path=rel_path,
+            real_abs=real_abs,
+            raw=read_bytes(real_abs),
+            newline=newline,
+            task_art=task_art,
+            work_abs=work_abs,
+            cfg=cfg,
+            llm=llm,
+            verbose_llm=verbose_llm,
+            ruff_fix_mode=ruff_fix_mode,
+            logger=logger,
+        )
+        # Refresh review + selection for next pass.
+        for fp in ("review.md", "selection.json"):
+            pth = os.path.join(task_art, fp)
+            try:
+                if os.path.exists(pth):
+                    os.remove(pth)
+            except Exception:
+                pass
+    write_text(
+        os.path.join(task_art, "run_stopped.txt"),
+        "Stopped after max passes without reaching W.\n",
+    )

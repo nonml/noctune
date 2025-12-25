@@ -6,7 +6,8 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 
 
 def sha256_text(s: str) -> str:
@@ -30,6 +31,7 @@ class RunPaths:
     logs_dir: str
     artifacts_dir: str
     backups_dir: str
+    work_dir: str
 
 
 def ensure_run_paths(repo_root: str, run_id: str | None) -> RunPaths:
@@ -41,14 +43,22 @@ def ensure_run_paths(repo_root: str, run_id: str | None) -> RunPaths:
     # Layout: <repo_root>/.noctune_cache/runs/<run_id>/...
     run_dir = os.path.join(repo_root, ".noctune_cache", "runs", run_id)
     state_dir = os.path.join(run_dir, "state")
+    tasks_dir = os.path.join(state_dir, "tasks")
     logs_dir = os.path.join(run_dir, "logs")
     artifacts_dir = os.path.join(run_dir, "artifacts")
     backups_dir = os.path.join(run_dir, "backups")
-    for d in [state_dir, logs_dir, artifacts_dir, backups_dir]:
+    work_dir = os.path.join(run_dir, "work")
+    for d in [state_dir, tasks_dir, logs_dir, artifacts_dir, backups_dir, work_dir]:
         os.makedirs(d, exist_ok=True)
-    os.makedirs(os.path.join(state_dir, "tasks"), exist_ok=True)
     return RunPaths(
-        repo_root, run_id, run_dir, state_dir, logs_dir, artifacts_dir, backups_dir
+        repo_root,
+        run_id,
+        run_dir,
+        state_dir,
+        logs_dir,
+        artifacts_dir,
+        backups_dir,
+        work_dir,
     )
 
 
@@ -88,3 +98,24 @@ def detect_newline_style(data: bytes) -> str:
     if b"\r\n" in data:
         return "\r\n"
     return "\n"
+
+
+def find_latest_run_id(root: Path) -> Optional[str]:
+    runs_dir = root.resolve() / ".noctune_cache" / "runs"
+    if not runs_dir.exists():
+        return None
+
+    candidates = []
+    for p in runs_dir.iterdir():
+        if not p.is_dir():
+            continue
+        # Prefer runs that actually look like runs (have state/run.json),
+        # but still allow fallback to directory mtime.
+        run_json = p / "state" / "run.json"
+        mtime = run_json.stat().st_mtime if run_json.exists() else p.stat().st_mtime
+        candidates.append((mtime, p.name))
+
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)  # newest first
+    return candidates[0][1]

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "noctune"
-version = "0.1.0"
+version = "0.2.0"
 description = "Resumable, local-LLM code upgrader for Python repos (no diffs, per-symbol ops)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,7 +20,7 @@ noctune = "noctune.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/noctune"]
-include = ["src/noctune/prompts/*.txt"]
+include = ["src/noctune/prompts/*.md", "src/noctune/prompts/*.txt"]
 
 [tool.noctune]
 # Optional: you can keep config in pyproject.toml under [tool.noctune]

@@ -7,22 +7,6 @@ from .indexer import extract_symbols
 from .state import detect_newline_style
 
 
-def _split_lines_keepends(text: str, newline: str) -> list[str]:
-    # keepends split but normalized to the file newline style
-    # First, normalize incoming to \n, then re-emit with newline
-    tmp = text.replace("\r\n", "\n")
-    lines = tmp.split("\n")
-    if len(lines) == 1:
-        return [lines[0]]
-    out = []
-    for i, line in enumerate(lines):
-        if i < len(lines) - 1:
-            out.append(line + newline)
-        else:
-            out.append(line)
-    return out
-
-
 def _get_newline_style(file_bytes: bytes) -> str:
     return detect_newline_style(file_bytes)
 

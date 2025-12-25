@@ -3,18 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import subprocess
-from dataclasses import dataclass
 from typing import Any
-
-
-@dataclass
-class GateResult:
-    ok: bool
-    parse_ok: bool
-    ruff_ok: bool
-    parse_error: str | None
-    ruff_json: Any | None
-    ruff_stderr: str | None
 
 
 def check_parse(source: str) -> tuple[bool, str | None]:

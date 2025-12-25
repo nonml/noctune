@@ -1,47 +1,130 @@
 # Noctune 🦉
 
-Noctune is a local, agentic code editor for Python monorepos that is designed to work with small or budget-constrained LLMs.
+Noctune is a resumable, local‑LLM agentic “code upgrader” for Python monorepos. It is designed for small or budget-constrained LLMs and long overnight runs: it plans, gathers minimal repo evidence (imports + grep callsites), proposes per‑symbol upgrades, applies them on a temporary work copy, runs lightweight gates (parse + Ruff), and then asks an automated approver whether the change is worth patching into the real file.
 
-It runs a resumable, per-file pipeline that is intentionally conservative and failure-tolerant: it plans, gathers minimal repo impact evidence, proposes per-symbol edits, applies them (with explicit permission), then “approves” the result using deterministic gates (parse + Ruff). If anything fails, it attempts lightweight repairs and, as a last resort, writes a full-file proposal for a human to apply.
-
-Noctune speaks to any OpenAI-compatible server that implements `POST /v1/chat/completions` (for example, llama.cpp’s OpenAI server).
-
-## Key ideas
-
-- One model, all roles: the same model is used for planning, review, editing, and micro-repairs.
-- Small-context friendly: prefers per-symbol edits (`Class.method` is a first-class edit unit).
-- No unified diffs: edits are applied via symbol replacement, not patch hunks.
-- Failure-tolerant: any LLM stage may fail; the pipeline checkpoints every stage and continues from the last good artifact.
-- Deterministic “approver”: after edits, Noctune runs `ast.parse` and `ruff check` (optionally `ruff check --fix` with safe fixes) and only keeps changes that pass.
-- No repo execution: Noctune never runs tests or executes your code. It only parses and lints.
+Key properties:
+- CLI-first, ruff-like UX (`noctune ...`)
+- One file at a time; per-symbol editing (functions/classes/methods) instead of unified diffs
+- Resumable checkpoints (you can stop/restart without losing progress)
+- “Temp-first” editing: changes are validated on a work file before touching the real file
+- OpenAI-compatible `/v1/chat/completions` only (llama.cpp and similar servers)
 
 ## Install
 
-This repository is structured as an installable package, but you can also run it from a checkout.
+This repo is not published to PyPI yet. Install locally:
 
-- Development install:
+```bash
+python -m pip install -e .
+```
 
-  - `python -m pip install -e .`
+or
 
-Python 3.11+ is required.
+```bash
+pip install github+https://github.com/nonml/noctune
+```
 
 ## Quickstart
 
-1) From your repo root, initialize config:
+1) Initialize in your repo root:
 
-- `noctune init`
+```bash
+noctune init --root .
+```
 
-This writes `noctune.toml` and (optionally) offers to add `.noctune_cache/` to your `.gitignore`.
+This creates:
+- `./noctune.toml` (repo-local config)
+- `./.noctune_cache/overrides/*.md` (editable prompts)
 
-2) Run the full pipeline across your repo:
+2) Configure your LLM endpoint in `noctune.toml`:
 
-- `noctune run --root .`
+```toml
+[tool.noctune]
+allow_apply = false
+ruff_required = true
+rg_optional = true
 
-Or provide an explicit file list (one relative `.py` path per line):
+[tool.noctune.llm]
+base_url = "http://127.0.0.1:8080/v1"
+# model = "qwen"    # optional; server may default
+api_key = "local"   # optional for local servers
+stream = true
+verbose_stream = true
+stream_print_reasoning = true
+```
 
-- `noctune run --root . --file-list path/to/files.txt`
+Environment overrides (useful for secrets):
+
+- `NOCTUNE_BASE_URL`
+- `NOCTUNE_API_KEY`
+- `NOCTUNE_HEADERS_JSON` (JSON dict)
+
+3) Run on the whole repo:
+
+```bash
+noctune run --root .
+```
+
+Or run on a file list (one relative `.py` per line):
+
+```bash
+noctune run --root . --file-list path/to/files.txt
+```
+
+Or target specific paths:
+
+```bash
+noctune edit --root . src/foo.py
+noctune review --root . src/foo.py
+```
 
 If you pass `--yes`, Noctune will not prompt interactively. In non-interactive mode, you must have granted permission previously by setting `allow_apply = true` in `noctune.toml`.
+
+Artifacts are written under:
+
+- `./.noctune_cache/runs/<run_id>/artifacts/<task_id>/...`
+
+## How it works
+
+For each file, Noctune executes a resumable flow:
+
+1. Plan
+- Writes `plan.md` (or `plan.json`) per file.
+- Establishes a small, explicit plan and constraints.
+
+2. Review
+- Writes `review.md` and a label (`N`, `P`, `W`).
+- Defines what must change to reach `W` (high-leverage checklist).
+
+3. Select
+- Writes `selection.json`.
+- Uses the review plus minimal evidence to choose 1–3 high-leverage symbols/chunks and produces a concrete “change spec” (free-form bullets/pseudo-code).
+
+4. Edit (temp-first)
+- Editor sees only the symbol code + selector change spec (not the full file).
+- Applies to work copy, runs gates, repairs if needed.
+
+5. Approve
+- Approver compares BEFORE vs AFTER (no unified diff) and approves/rejects patching the real file.
+
+6. Iterate
+- Repeat `review → select → edit → approve` until `W` or pass limit.
+
+2. In the “Commands” section, adjust these descriptions to reflect that:
+
+- `noctune plan` does only plan
+- `noctune review` does only review
+- `noctune edit` should require that `selection.json` already exists (or it can internally run `select` if missing, but the conceptual pipeline is still Review → Select → Edit)
+- `noctune run` orchestrates: plan → review → select → edit → approve, then loops review/select/edit/approve until W or max passes.
+
+If you want the tooling to be consistent with the docs, you should also ensure the actual orchestrator calls stages in that order. If the code currently runs select before review, fix order in the orchestrator (typically a single function like `run_file_pipeline(...)`).
+
+If you tell me whether you want `noctune edit` to automatically trigger `select` when missing (convenient) or to refuse and instruct the user to run `noctune select` first (stricter), I’ll give you the exact wording for the README and the cleanest behavior for v1.
+
+
+Important constraints:
+- No git integration.
+- No code execution.
+- Tests are intentionally skipped in this version.
 
 ## Commands
 
@@ -70,28 +153,19 @@ Noctune discovers configuration in this order:
 1) `noctune.toml` at the repo root (recommended)
 2) `pyproject.toml` under `[tool.noctune]`
 
-`noctune init` writes a minimal `noctune.toml` like:
+## Editing prompts
 
-```toml
-[tool.noctune]
-allow_apply = false
-ruff_required = true
-rg_optional = true
+Noctune ships default prompts inside the package, but always writes repo-local overrides on `init`:
 
-[tool.noctune.llm]
-base_url = "http://127.0.0.1:8080"
-model = ""
-api_key = ""
-stream = true
-verbose_stream = true
-stream_print_reasoning = true
-```
+- `./.noctune_cache/overrides/plan.md`
+- `./.noctune_cache/overrides/select.md`
+- `./.noctune_cache/overrides/review.md`
+- `./.noctune_cache/overrides/edit.md`
+- `./.noctune_cache/overrides/repair.md`
+- `./.noctune_cache/overrides/approve.md`
 
-Environment overrides (useful for secrets):
+Edit those files directly. You do not need to reinstall the package.
 
-- `NOCTUNE_BASE_URL`
-- `NOCTUNE_API_KEY`
-- `NOCTUNE_HEADERS_JSON` (JSON dict)
 
 ## Output layout and checkpoints
 
@@ -134,9 +208,8 @@ If the file still cannot pass the gates, Noctune restores the pre-apply backup s
 Noctune is designed for overnight runs. It treats Ctrl+C as a structured “human support” signal:
 
 - First Ctrl+C: prompts you for guidance and then continues.
-- Second Ctrl+C: skips the current file.
-- Third Ctrl+C: terminates the run.
+- Second Ctrl+C: terminates the run.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT (see `LICENSE`).
