@@ -13,6 +13,7 @@ authors = [{ name = "Nontawat Srilert" }]
 dependencies = [
   "httpx>=0.27.0",
   "pathspec>=0.12.1",
+  "openai",
 ]
 
 [project.scripts]
@@ -20,7 +21,7 @@ noctune = "noctune.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/noctune"]
-include = ["src/noctune/prompts/*.md", "src/noctune/prompts/*.txt"]
+include = ["src/noctune/prompts/*.md"]
 
 [tool.noctune]
 # Optional: you can keep config in pyproject.toml under [tool.noctune]

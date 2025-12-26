@@ -1,29 +1,10 @@
 from __future__ import annotations
 
-import json
 import sys
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-
-def build_chat_completions_url(base_url: str) -> str:
-    """Build a correct OpenAI-compatible /v1/chat/completions URL.
-
-    Accepts base_url forms:
-      - http://127.0.0.1:8080
-      - http://127.0.0.1:8080/v1
-      - http://127.0.0.1:8080/v1/chat/completions
-    """
-    b = (base_url or "").strip().rstrip("/")
-    if not b:
-        raise ValueError("LLM base_url is empty")
-    if b.endswith("/v1/chat/completions"):
-        return b
-    if b.endswith("/v1"):
-        return b + "/chat/completions"
-    return b + "/v1/chat/completions"
+from openai import OpenAI
 
 
 def _extract_text(x: Any) -> str:
@@ -55,20 +36,93 @@ def _print_stream_header(tag: str, kind: str) -> None:
     sys.stdout.flush()
 
 
+def _get_attr(obj: Any, name: str, default: Any = None) -> Any:
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return default
+
+
+def _as_dict(obj: Any) -> dict[str, Any] | None:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj
+    dump = _get_attr(obj, "model_dump")
+    if callable(dump):
+        try:
+            v = dump()
+            return v if isinstance(v, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _extract_completion_content(resp: Any) -> str:
+    """
+    Extract `choices[0].message.content` from an OpenAI ChatCompletion-like response.
+    Supports both SDK objects and dicts.
+    """
+    d = _as_dict(resp)
+    if d is not None:
+        choices = d.get("choices") or []
+        if choices:
+            msg = (choices[0] or {}).get("message") or {}
+            return _extract_text(msg.get("content"))
+        return ""
+
+    choices = _get_attr(resp, "choices") or []
+    if not choices:
+        return ""
+    msg = _get_attr(choices[0], "message")
+    return _extract_text(_get_attr(msg, "content"))
+
+
+def _iter_stream_deltas(chunk: Any) -> tuple[str, str]:
+    """
+    Return (reasoning_text, content_text) from an OpenAI ChatCompletionChunk-like chunk.
+    Supports both SDK objects and dicts.
+    """
+    d = _as_dict(chunk)
+    if d is not None:
+        choices = d.get("choices") or []
+        if not choices:
+            return "", ""
+        delta = (choices[0] or {}).get("delta") or {}
+        if not isinstance(delta, dict):
+            return "", ""
+        reasoning_text = _extract_text(delta.get("reasoning_content"))
+        content_text = _extract_text(delta.get("content"))
+        return reasoning_text, content_text
+
+    choices = _get_attr(chunk, "choices") or []
+    if not choices:
+        return "", ""
+    delta = _get_attr(choices[0], "delta")
+    reasoning_text = _extract_text(_get_attr(delta, "reasoning_content"))
+    content_text = _extract_text(_get_attr(delta, "content"))
+    return reasoning_text, content_text
+
+
 @dataclass
 class LLMClient:
     base_url: str
-    api_key: str = ""
-    model: str = ""
-    timeout_s: int = 120
+    api_key: str
+    model: str | None
+    timeout_s: int = 180
     extra_headers: dict[str, str] | None = None
     request_overrides: dict[str, Any] | None = None
-    mode: str = "openai_chat"  # openai_chat
-
-    # Local streaming controls (do not affect server behavior unless stream=True payload is used)
     stream_default: bool = False
     stream_print_reasoning: bool = True
     stream_print_headers: bool = True
+
+    def __post_init__(self) -> None:
+        self._client = OpenAI(
+            api_key=self.api_key or "local",
+            base_url=self.base_url,
+            timeout=self.timeout_s,
+            default_headers=self.extra_headers or None,
+        )
 
     def chat(
         self,
@@ -79,55 +133,70 @@ class LLMClient:
         verbose: bool = False,
         tag: str = "",
     ) -> tuple[bool, str]:
-        if self.mode != "openai_chat":
-            return False, f"Unsupported LLM mode: {self.mode}"
-        url = build_chat_completions_url(self.base_url)
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        if self.extra_headers:
-            headers.update(self.extra_headers)
+        do_stream = self.stream_default if stream is None else bool(stream)
 
-        payload: dict[str, Any] = {
-            "model": self.model or None,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        }
-        # drop None model to let server default
-        if payload["model"] is None:
-            payload.pop("model", None)
+        # Always set a model string. Many OpenAI-compatible servers behave poorly
+        # if model is omitted.
+        model = (self.model or "").strip()
+        if not model:
+            return False, "LLMClient.model is empty; set [tool.noctune.llm].model"
 
+        payload: dict[str, Any] = {}
         if self.request_overrides:
             # shallow merge
             payload.update(self.request_overrides)
 
-        do_stream = self.stream_default if stream is None else bool(stream)
-        if do_stream:
-            payload["stream"] = True
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
 
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
-                content_type = (resp.headers.get("Content-Type") or "").lower()
-                if do_stream and "text/event-stream" in content_type:
-                    ok, txt = self._read_stream(resp, verbose=verbose, tag=tag)
-                    return ok, txt
-                raw = resp.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as e:
-            return (
-                False,
-                f"HTTPError {e.code}: {e.read().decode('utf-8', errors='replace')}",
+            if do_stream:
+                stream_iter = self._client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    stream=True,
+                    **payload,
+                )
+                analysis_header_printed = False
+                response_header_printed = False
+                parts: list[str] = []
+
+                for chunk in stream_iter:
+                    reasoning_text, content_text = _iter_stream_deltas(chunk)
+
+                    if reasoning_text and verbose and self.stream_print_reasoning:
+                        if self.stream_print_headers and not analysis_header_printed:
+                            _print_stream_header(tag, "analysis")
+                            analysis_header_printed = True
+                        sys.stdout.write(reasoning_text)
+                        sys.stdout.flush()
+
+                    if content_text:
+                        if verbose:
+                            if (
+                                self.stream_print_headers
+                                and not response_header_printed
+                            ):
+                                _print_stream_header(tag, "response")
+                                response_header_printed = True
+                            sys.stdout.write(content_text)
+                            sys.stdout.flush()
+                        parts.append(content_text)
+
+                if verbose and response_header_printed:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+
+                return True, "".join(parts)
+            resp = self._client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=False,
+                **payload,
             )
-        except Exception as e:
-            return False, f"LLM request failed: {e}"
-
-        try:
-            obj = json.loads(raw)
-            choice = obj["choices"][0]
-            content = choice["message"]["content"]
+            content = _extract_completion_content(resp)
             if do_stream and verbose:
                 # Server did not stream; still print the final content for operator visibility.
                 if self.stream_print_headers:
@@ -136,78 +205,5 @@ class LLMClient:
                 sys.stdout.write("\n")
                 sys.stdout.flush()
             return True, content
-        except Exception:
-            return False, f"Could not parse LLM response as OpenAI chat: {raw[:1000]}"
-
-    def _read_stream(self, resp, *, verbose: bool, tag: str) -> tuple[bool, str]:
-        """Parse OpenAI-compatible SSE stream, print deltas if verbose, return collected content."""
-        analysis_header_printed = False
-        response_header_printed = False
-
-        parts: list[str] = []
-        total_chars = 0
-
-        # Read line-by-line; OpenAI streams send `data: <json>` lines separated by blank lines.
-        while True:
-            line_b = resp.readline()
-            if not line_b:
-                break
-            line = line_b.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            if not line.startswith("data:"):
-                continue
-
-            data_str = line[len("data:") :].strip()
-            if data_str == "[DONE]":
-                break
-
-            try:
-                chunk = json.loads(data_str)
-            except Exception:
-                # ignore malformed chunk; keep going
-                continue
-
-            if not chunk or not isinstance(chunk, dict):
-                continue
-            if "error" in chunk:
-                return False, str(chunk.get("error"))[:2000]
-            if not chunk.get("choices"):
-                continue
-
-            try:
-                delta = chunk["choices"][0].get("delta") or {}
-            except Exception:
-                continue
-
-            # Reasoning (if present) -> print only
-            reasoning_field = (
-                delta.get("reasoning_content") if isinstance(delta, dict) else None
-            )
-            reasoning_text = _extract_text(reasoning_field)
-            if reasoning_text and verbose and self.stream_print_reasoning:
-                if self.stream_print_headers and not analysis_header_printed:
-                    _print_stream_header(tag, "analysis")
-                    analysis_header_printed = True
-                sys.stdout.write(reasoning_text)
-                sys.stdout.flush()
-
-            # Content -> print + collect
-            content_field = delta.get("content") if isinstance(delta, dict) else None
-            content_text = _extract_text(content_field)
-            if content_text:
-                if verbose:
-                    if self.stream_print_headers and not response_header_printed:
-                        _print_stream_header(tag, "response")
-                        response_header_printed = True
-                    sys.stdout.write(content_text)
-                    sys.stdout.flush()
-                parts.append(content_text)
-                total_chars += len(content_text)
-
-        # Ensure final newline separation if we printed content
-        if verbose and response_header_printed:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-
-        return True, "".join(parts)
+        except Exception as e:
+            return False, f"LLM request failed (openai sdk): {e}"

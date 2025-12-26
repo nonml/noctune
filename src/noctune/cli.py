@@ -40,7 +40,7 @@ def _collect_rel_paths(
         for s in paths:
             p = (root / s).resolve()
             if p.is_dir():
-                for f in scanner.iter_py_files(p):
+                for f in scanner.iter_python_files(p):
                     out.append(f.relative_to(root).as_posix())
             else:
                 if p.exists() and p.suffix == ".py":
@@ -48,7 +48,7 @@ def _collect_rel_paths(
         return out
 
     # default: entire repo
-    return [p.relative_to(root).as_posix() for p in scanner.iter_py_files(root)]
+    return [p.relative_to(root).as_posix() for p in scanner.iter_python_files()]
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -119,10 +119,6 @@ def _cmd_stage(stage: str, args: argparse.Namespace) -> int:
         log_level=args.log_level,
         verbosity=args.v,
     )
-
-
-def cmd_plan(args: argparse.Namespace) -> int:
-    return _cmd_stage("plan", args)
 
 
 def cmd_review(args: argparse.Namespace) -> int:
@@ -205,14 +201,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_init)
 
     for name, fn, help_txt in [
-        ("plan", cmd_plan, "Create plan.md artifact"),
         ("review", cmd_review, "Create review.md artifact"),
         ("edit", cmd_edit, "Draft+Editor+Approver pass (patches only if approved)"),
         ("repair", cmd_repair, "Heuristic + ruff repair only"),
         (
             "run",
             cmd_run,
-            "Full loop: plan -> review -> edit -> review (up to a few passes)",
+            "Full loop: review -> draft -> edit -> approve (repeat up to a few passes)",
         ),
     ]:
         spx = sub.add_parser(name, parents=[common], help=help_txt)

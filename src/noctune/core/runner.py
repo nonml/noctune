@@ -199,7 +199,7 @@ class StageResult:
 
 def run_stage(
     *,
-    stage: str,  # plan|review|edit|repair|run
+    stage: str,  # review|edit|repair|run
     root: Path,
     rel_paths: List[str],
     cfg: NoctuneConfig,
@@ -228,7 +228,6 @@ def run_stage(
             timeout_s=180,
             extra_headers=cfg.llm.headers or {},
             request_overrides=None,
-            mode="openai_chat",
             stream_default=bool(cfg.llm.stream),
             stream_print_reasoning=bool(cfg.llm.stream_print_reasoning),
             stream_print_headers=True,
@@ -298,9 +297,7 @@ def run_stage(
                 )
 
             # Dispatch by stage
-            if stage == "plan":
-                _do_plan(root, rel_path, raw, task_art, llm, verbose_llm, logger)
-            elif stage == "review":
+            if stage == "review":
                 _do_review(root, rel_path, raw, task_art, llm, verbose_llm, logger)
             elif stage == "edit":
                 _do_edit(
@@ -409,47 +406,6 @@ def run_stage(
             return 130
 
     return 0
-
-
-def _do_plan(
-    root: Path,
-    rel_path: str,
-    raw: bytes,
-    task_art: str,
-    llm: Optional[LLMClient],
-    verbose_llm: bool,
-    logger: EventLogger,
-) -> None:
-    if llm is None:
-        write_text(os.path.join(task_art, "plan.md"), "LLM disabled; skipping plan.\n")
-        return
-    plan_path = os.path.join(task_art, "plan.md")
-    if os.path.exists(plan_path):
-        return
-
-    src_text = raw.decode("utf-8", errors="replace")
-    impact = _impact_pack(root, src_text, max_names=10)
-
-    # Plan (free-form)
-    system = load_prompt(root, "plan.md")
-    user = (
-        f"Path: {rel_path}\n\nImports:\n"
-        + "\n".join(impact.imports[:60])
-        + "\n\nSource:\n"
-        + src_text
-    )
-    ok, out = _llm_chat_logged(
-        llm=llm,
-        system=system,
-        user=user,
-        logger=logger,
-        stage="plan",
-        tag=f"plan:{rel_path}",
-        verbose_llm=verbose_llm,
-        stream=True,
-    )
-    write_text(plan_path, out + "\n")
-    logger.info(event="plan_written", rel_path=rel_path, ok=ok)
 
 
 def _do_draft(
@@ -598,11 +554,7 @@ def _do_edit(
             os.path.join(task_art, "edit_skipped.txt"), "LLM disabled; skipping edit.\n"
         )
         return
-
     # Edit is allowed as a standalone task. If prerequisites are missing, create them.
-    plan_path = os.path.join(task_art, "plan.md")
-    if not os.path.exists(plan_path):
-        _do_plan(root, rel_path, raw, task_art, llm, verbose_llm, logger)
 
     review_path = os.path.join(task_art, "review.md")
     if not os.path.exists(review_path):
@@ -992,12 +944,9 @@ def _do_run_full(
     ruff_fix_mode: str,
     logger: EventLogger,
 ) -> None:
-    # Full loop: plan -> review -> draft -> edit -> approve; then repeat review/draft/edit as needed.
+    # Full loop: review -> draft -> edit -> approve; then repeat review/draft/edit as needed.
     max_passes = 3
     for p in range(max_passes):
-        _do_plan(
-            root, rel_path, read_bytes(real_abs), task_art, llm, verbose_llm, logger
-        )
         _do_review(
             root, rel_path, read_bytes(real_abs), task_art, llm, verbose_llm, logger
         )

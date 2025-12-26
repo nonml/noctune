@@ -3,11 +3,13 @@ from __future__ import annotations
 import ast
 import json
 import subprocess
+from pathlib import Path
 from typing import Any
 
 
-def check_parse(source: str) -> tuple[bool, str | None]:
+def check_parse(file_abs: str) -> tuple[bool, str | None]:
     try:
+        source = Path(file_abs).read_text(encoding="utf-8", errors="replace")
         ast.parse(source)
         return True, None
     except SyntaxError as e:

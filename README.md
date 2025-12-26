@@ -20,7 +20,7 @@ python -m pip install -e .
 or
 
 ```bash
-pip install github+https://github.com/nonml/noctune
+pip install git+https://github.com/nonml/noctune
 ```
 
 ## Quickstart
@@ -87,31 +87,27 @@ Artifacts are written under:
 
 For each file, Noctune executes a resumable flow:
 
-1. Plan
-- Writes `plan.md` per file.
-- Establishes a small, explicit plan and constraints.
-
-2. Review
+1. Review
 - Writes `review.md` and a label (`N`, `P`, `W`).
 - Defines what must change to reach `W` (high-leverage checklist).
 
-3. Draft
+2. Draft
 - Writes `draft.json`.
-- Uses the review plus minimal evidence to choose 1–3 high-leverage symbols/chunks and produces a concrete an editor-ready payload: `edit_prompt` (plain text) + `draft_code` (near-final replacement code).
+- Uses the review plus minimal evidence to choose 1–3 high-leverage symbols/chunks and produces a concrete editor-ready payload: `edit_prompt` (plain text) + `draft_code` (near-final replacement code).
 
-4. Edit (temp-first)
+3. Edit (temp-first)
 - Editor sees only the symbol code + Draft payload (edit_prompt + draft_code) (not the full file).
 - Applies to work copy, runs gates, repairs if needed.
 
-5. Approve
+4. Approve
 - Approver compares BEFORE vs AFTER (no unified diff) and approves/rejects patching the real file.
 
-6. Iterate
+5. Iterate
 - Repeat `review → draft → edit → approve` until `W` or pass limit.
 
 Notes on orchestration:
-- `noctune edit` will create any missing prerequisites for a file (plan, review, draft) before attempting edits.
-- `noctune run` orchestrates: plan → review → draft → edit → approve, then loops review/draft/edit/approve until Label `W` or max passes.
+- `noctune edit` will create any missing prerequisites for a file (review, draft) before attempting edits.
+- `noctune run` orchestrates: review → draft → edit → approve, then loops review/draft/edit/approve until Label `W` or max passes.
 
 
 Important constraints:
@@ -123,11 +119,10 @@ Important constraints:
 
 Noctune follows a “ruff-like” CLI shape:
 
-- `noctune plan` — generate `plan.md` per file.
 - `noctune review` — generate `review.md` per file.
-- `noctune edit` — run one edit pass per file (plan + review + edit + gates).
+- `noctune edit` — run one edit pass per file (review + draft + edit + approve + gates).
 - `noctune repair` — attempt to repair the current file state using deterministic and micro-LLM repair.
-- `noctune run` — do everything, potentially with multiple edit passes until Label `W` or a pass limit.
+- `noctune run` — full loop (review + draft + edit + approve), potentially with multiple passes until Label `W` or a pass limit.
 
 Common flags:
 
@@ -150,7 +145,6 @@ Noctune discovers configuration in this order:
 
 Noctune ships default prompts inside the package, but always writes repo-local overrides on `init`:
 
-- `./.noctune_cache/overrides/plan.md`
 - `./.noctune_cache/overrides/draft.md`
 - `./.noctune_cache/overrides/review.md`
 - `./.noctune_cache/overrides/edit.md`
@@ -171,7 +165,6 @@ All state is stored under your repo root:
 
 Per-file artifacts include (when applicable):
 
-- `plan.json`
 - `impact.json`
 - `review.md`
 - `edit_ops_p<N>.json` and `edit_raw_p<N>.txt`

@@ -6,7 +6,6 @@ from pathlib import Path
 # Shipped prompts live in the packaged module: noctune.prompts/
 # Users can override prompts repo-locally at: --root/.noctune_cache/overrides/*.md
 _PROMPT_FILES = (
-    "plan.md",
     "review.md",
     "draft.md",
     "edit.md",
@@ -25,7 +24,7 @@ def overrides_dir(root: Path) -> Path:
 
 def ensure_prompt_overrides(root: Path, *, overwrite: bool = False) -> Path:
     """
-    Ensure --root/.noctune_cache/overrides/{plan,review,edit,repair}.md exist.
+    Ensure --root/.noctune_cache/overrides/{review,draft,edit,repair,approve}.md exist.
     Does not overwrite by default.
     Returns the overrides directory path.
     """
