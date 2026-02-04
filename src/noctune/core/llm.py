@@ -4,7 +4,12 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
-from openai import OpenAI
+try:
+    # Optional at import time so unit tests (and non-OpenAI backends) can run
+    # without requiring the openai package.
+    from openai import OpenAI  # type: ignore
+except Exception:  # pragma: no cover
+    OpenAI = None  # type: ignore
 
 
 def _extract_text(x: Any) -> str:
@@ -117,6 +122,11 @@ class LLMClient:
     stream_print_headers: bool = True
 
     def __post_init__(self) -> None:
+        if OpenAI is None:
+            raise ModuleNotFoundError(
+                "openai package not installed. Install dependencies or use a compatible backend that provides an OpenAI SDK. "
+                "Try: pip install openai"
+            )
         self._client = OpenAI(
             api_key=self.api_key or "local",
             base_url=self.base_url,

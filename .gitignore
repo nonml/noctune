@@ -1,5 +1,17 @@
 *.env
 .vscode
+.DS_Store
+
+# Reference-only sandbox (kept out of the main build)
+noctune-legacy/
+
+# Node / web apps
+**/node_modules/
+**/.next/
+**/out/
+**/build/
+**/.turbo/
+**/.vercel/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -167,3 +179,7 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 .noctune_cache/
+
+# Keep `lib/` ignored for Python packaging, but allow Next.js source under Studio web.
+!apps/studio-web/lib/
+!apps/studio-web/lib/**

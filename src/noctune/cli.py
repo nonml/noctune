@@ -8,7 +8,7 @@ from .core.config import NoctuneConfig, load_config, write_noctune_toml
 from .core.prompts import ensure_prompt_overrides
 from .core.runner import run_stage
 from .core.scanner import RepoScanner
-from .core.state import find_latest_run_id
+from .core.state import find_latest_run_id, ensure_run_paths
 from .core.tools import which
 
 
@@ -103,6 +103,10 @@ def _cmd_stage(stage: str, args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     cfg, _, _ = load_config(root)
     _ensure_tooling(cfg)
+    if getattr(args, 'approval_mode', None):
+        cfg.approvals.mode = str(args.approval_mode)
+    if getattr(args, "pack", None):
+        cfg.policies.packs = [str(args.pack)]
 
     rel_paths = _collect_rel_paths(
         root, getattr(args, "paths", []) or [], args.file_list
@@ -137,6 +141,36 @@ def cmd_run(args: argparse.Namespace) -> int:
     return _cmd_stage("run", args)
 
 
+
+def cmd_studio(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+
+    if args.action == "stop":
+        run_id = args.run_id or find_latest_run_id(str(root))
+        if not run_id:
+            raise SystemExit("noctune studio stop: no run found")
+        rp = ensure_run_paths(str(root), run_id)
+        Path(rp.state_dir).mkdir(parents=True, exist_ok=True)
+        (Path(rp.state_dir) / "stop.flag").write_text("stop\n", encoding="utf-8")
+        print(f"noctune studio: stop.flag written for run {run_id}")
+        return 0
+
+    if args.action == "mcp":
+        from .studio.mcp_server import main as mcp_main
+        import asyncio
+        asyncio.run(mcp_main())
+        return 0
+
+    # serve
+    try:
+        import uvicorn
+    except Exception as e:
+        raise SystemExit('noctune studio serve requires extras: pip install -e ".[studio]"') from e
+    from .studio.daemon import create_app
+    app = create_app()
+    uvicorn.run(app, host=args.host, port=int(args.port))
+    return 0
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--root", default=".", help="Repo root (default: .)")
@@ -145,30 +179,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Text file with one relative .py path per line",
     )
-    common.add_argument(
-        "--run-id", default=None, help="Reuse an existing run-id (resume)"
-    )
-    common.add_argument(
-        "--max-files", type=int, default=None, help="Stop after N files"
-    )
+    common.add_argument("--run-id", default=None, help="Reuse an existing run-id (resume)")
+    common.add_argument("--max-files", type=int, default=None, help="Stop after N files")
     common.add_argument(
         "--ruff-fix",
         choices=["safe", "off"],
         default="safe",
         help="Apply ruff --fix on temp/work file",
     )
+    common.add_argument("--llm", choices=["on", "off"], default="on", help="Enable/disable LLM calls")
     common.add_argument(
-        "--llm", choices=["on", "off"], default="on", help="Enable/disable LLM calls"
+        "--approval-mode",
+        choices=["none", "prompt", "file", "auto"],
+        default=None,
+        help="Override [tool.noctune.approvals].mode for this run",
     )
     common.add_argument(
-        "--log-level", choices=["DEBUG", "INFO", "WARN", "ERROR"], default="INFO"
+        "--pack",
+        default=None,
+        help="Policy pack name (overrides [tool.noctune.policies].packs[0])",
     )
-    common.add_argument(
-        "-v", action="count", default=0, help="Increase verbosity (-v, -vv)"
-    )
-    common.add_argument(
-        "--yes", action="store_true", help="Non-interactive mode (init prompts)"
-    )
+    common.add_argument("--log-level", choices=["DEBUG", "INFO", "WARN", "ERROR"], default="INFO")
+    common.add_argument("-v", action="count", default=0, help="Increase verbosity (-v, -vv)")
+    common.add_argument("--yes", action="store_true", help="Non-interactive mode (init prompts)")
     common.add_argument(
         "--continue",
         dest="continue_last",
@@ -179,44 +212,32 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="noctune")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser(
-        "init", parents=[common], help="First-time setup: config + prompt overrides"
-    )
-    sp.add_argument(
-        "--base-url",
-        default=None,
-        help="LLM base URL (OpenAI-compatible). Example: http://127.0.0.1:8001/v1",
-    )
-    sp.add_argument(
-        "--model", default=None, help="Model name (optional; server may default)"
-    )
-    sp.add_argument(
-        "--api-key", default=None, help="API key (optional for local servers)"
-    )
-    sp.add_argument(
-        "--overwrite-prompts",
-        action="store_true",
-        help="Overwrite prompt overrides with packaged defaults",
-    )
-    sp.set_defaults(func=cmd_init)
+    # init
+    ip = sub.add_parser("init", help="Create noctune.toml + prompt overrides", parents=[common])
+    ip.add_argument("--base-url", default=None)
+    ip.add_argument("--api-key", default=None)
+    ip.add_argument("--model", default=None)
+    ip.add_argument("--overwrite-prompts", action="store_true")
+    ip.set_defaults(func=cmd_init)
 
-    for name, fn, help_txt in [
-        ("review", cmd_review, "Create review.md artifact"),
-        ("edit", cmd_edit, "Draft+Editor+Approver pass (patches only if approved)"),
-        ("repair", cmd_repair, "Heuristic + ruff repair only"),
-        (
-            "run",
-            cmd_run,
-            "Full loop: review -> draft -> edit -> approve (repeat up to a few passes)",
-        ),
-    ]:
-        spx = sub.add_parser(name, parents=[common], help=help_txt)
-        spx.add_argument(
-            "paths",
-            nargs="*",
-            help="Optional file(s) or directory(ies); default is whole repo",
-        )
-        spx.set_defaults(func=fn)
+    # stages
+    for name, fn in [("review", cmd_review), ("edit", cmd_edit), ("repair", cmd_repair), ("run", cmd_run)]:
+        sp2 = sub.add_parser(name, help=f"Run stage: {name}", parents=[common])
+        sp2.add_argument("paths", nargs="*", help="Files/dirs under --root (default: whole repo)")
+        sp2.set_defaults(func=fn)
+
+    # studio
+    sp = sub.add_parser("studio", help="Noctune Studio: run daemon/MCP, or stop an active run")
+    sp.add_argument("--root", default=".", help="Repo root (default: .)")
+    sp.add_argument(
+        "action",
+        choices=["serve", "mcp", "stop"],
+        help="serve: HTTP daemon, mcp: MCP stdio server, stop: create stop.flag for a run",
+    )
+    sp.add_argument("--host", default="127.0.0.1", help="Daemon host (serve)")
+    sp.add_argument("--port", type=int, default=7331, help="Daemon port (serve)")
+    sp.add_argument("--run-id", default=None, help="Run id to stop (stop). If omitted, stops latest run.")
+    sp.set_defaults(func=cmd_studio)
 
     return p
 

@@ -1,13 +1,6 @@
 from __future__ import annotations
 
-import sys
-import unittest
 from unittest import mock
-from pathlib import Path
-
-
-_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_ROOT / "src"))
 
 
 class _FakeMessage:
@@ -75,35 +68,31 @@ class _FakeOpenAI:
             return _FakeChatCompletion("ok")
 
 
-class TestLLMClient(unittest.TestCase):
-    def test_chat_non_stream_extracts_message_content(self) -> None:
-        from noctune.core import llm as llm_mod
+def test_chat_non_stream_extracts_message_content() -> None:
+    from noctune.core import llm as llm_mod
 
-        with mock.patch.object(llm_mod, "OpenAI", _FakeOpenAI):
-            c = llm_mod.LLMClient(
-                base_url="http://localhost:1234/v1",
-                api_key="local",
-                model="fake-model",
-                stream_default=False,
-            )
-            ok, out = c.chat(system="s", user="u", stream=False)
-            self.assertTrue(ok)
-            self.assertEqual(out, "ok")
-
-    def test_chat_stream_concatenates_chunks(self) -> None:
-        from noctune.core import llm as llm_mod
-
-        with mock.patch.object(llm_mod, "OpenAI", _FakeOpenAI):
-            c = llm_mod.LLMClient(
-                base_url="http://localhost:1234/v1",
-                api_key="local",
-                model="fake-model",
-                stream_default=True,
-            )
-            ok, out = c.chat(system="s", user="u", stream=True)
-            self.assertTrue(ok)
-            self.assertEqual(out, "hello world")
+    with mock.patch.object(llm_mod, "OpenAI", _FakeOpenAI):
+        c = llm_mod.LLMClient(
+            base_url="http://localhost:1234/v1",
+            api_key="local",
+            model="fake-model",
+            stream_default=False,
+        )
+        ok, out = c.chat(system="s", user="u", stream=False)
+        assert ok
+        assert out == "ok"
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_chat_stream_concatenates_chunks() -> None:
+    from noctune.core import llm as llm_mod
+
+    with mock.patch.object(llm_mod, "OpenAI", _FakeOpenAI):
+        c = llm_mod.LLMClient(
+            base_url="http://localhost:1234/v1",
+            api_key="local",
+            model="fake-model",
+            stream_default=True,
+        )
+        ok, out = c.chat(system="s", user="u", stream=True)
+        assert ok
+        assert out == "hello world"

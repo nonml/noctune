@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import fnmatch
 import os
 import re
 import time
@@ -10,18 +11,23 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .applier import apply_replace_symbol
+from .approvals import make_request, wait_for_decision, prompt_user
 from .config import NoctuneConfig
 from .gates import check_parse, check_ruff, ruff_fix_safe
+from .gitops import commit_patchsets, ensure_git_run_branch, head_sha, maybe_git_commit
 from .impact import build_impact
 from .indexer import Symbol, extract_symbols, index_file
 from .llm import LLMClient
 from .logger import EventLogger
+from .policy_packs import resolve_policy_pack
 from .prompts import load_prompt
 from .repair import heuristic_basic, micro_llm_repair
+from .run_state import init_run_state, update_run_state
 from .state import (
     detect_newline_style,
     ensure_run_paths,
     load_json,
+    now_iso,
     read_bytes,
     save_json,
     sha256_bytes,
@@ -121,16 +127,46 @@ def _impact_pack(root: Path, src_text: str, *, max_names: int = 10):
 
 
 def _meaningless_change(before: str, after: str) -> bool:
+    """Treat identical or whitespace-only changes as meaningless."""
     if before == after:
         return True
 
-    # ignore whitespace-only changes
     def norm(s: str) -> str:
+        # normalize newline + strip + drop blank lines
         return "\n".join(
             [ln.strip() for ln in s.replace("\r\n", "\n").split("\n") if ln.strip()]
         )
 
     return norm(before) == norm(after)
+
+
+def _matches_globs(rel_path: str, globs: list[str]) -> bool:
+    if not globs:
+        return False
+    rp2 = rel_path.replace("\\", "/")
+    for g in globs:
+        gg = str(g).replace("\\", "/")
+        if fnmatch.fnmatch(rp2, gg):
+            return True
+    return False
+
+
+def _changed_line_count(before: str, after: str) -> int:
+    import difflib
+
+    cnt = 0
+    for ln in difflib.unified_diff(
+        before.splitlines(keepends=False),
+        after.splitlines(keepends=False),
+        lineterm="",
+    ):
+        if not ln:
+            continue
+        if ln.startswith(("---", "+++", "@@")):
+            continue
+        if ln.startswith("+") or ln.startswith("-"):
+            cnt += 1
+    return cnt
 
 
 def _write_full_file_proposal(
@@ -212,8 +248,108 @@ def run_stage(
 ) -> int:
     rp = ensure_run_paths(str(root), run_id)
     logger = EventLogger(
-        events_path=os.path.join(rp.logs_dir, "events.jsonl"), level=log_level
+        events_path=os.path.join(rp.run_dir, "events", "events.jsonl"), level=log_level
     )
+
+    def _finish(code: int, status: str, msg: str | None = None) -> int:
+        # Patchset commit strategy: group worktree changes into a few commits at end-of-run.
+        # This should happen before we mark the run terminal.
+        patchset_commits: int | None = None
+        patchset_error: str | None = None
+        sha: str | None = None
+        try:
+            if (
+                status == "done"
+                and cfg.allow_apply
+                and cfg.git.enabled
+                and (cfg.git.commit_strategy or "") == "patchsets"
+                and stage in ("edit", "repair", "run")
+            ):
+                patchset_commits = commit_patchsets(
+                    root=root,
+                    changed_files=None,
+                    strategy=cfg.git.patchset_grouping,
+                    module_depth=cfg.git.patchset_module_depth,
+                    max_commits=cfg.git.patchset_max_commits,
+                    message_template=cfg.git.patchset_commit_message,
+                    logger=logger,
+                )
+            if cfg.git.enabled:
+                sha = head_sha(root)
+        except Exception as e:
+            patchset_error = str(e)
+        try:
+            update_run_state(
+                rp.state_dir,
+                run_id=rp.run_id,
+                repo_root=str(root),
+                stage=stage,
+                status=status,
+                pid=int(os.getpid()),
+                exit_code=int(code),
+                msg=msg or "",
+                patchset_commits=patchset_commits,
+                patchset_error=patchset_error,
+                head_sha=sha,
+            )
+        except Exception:
+            pass
+        return int(code)
+
+    # Mark run started (best-effort). Keep this fast and resumable.
+    try:
+        init_run_state(
+            state_dir=rp.state_dir,
+            run_id=rp.run_id,
+            repo_root=str(root),
+            stage=stage,
+            status="running",
+            pid=int(os.getpid()),
+            pack=(cfg.policies.packs[0] if cfg.policies.packs else None),
+            profile=(cfg.llm.model or None),
+        )
+        update_run_state(
+            rp.state_dir,
+            status="running",
+            pid=int(os.getpid()),
+            stage=stage,
+            repo_root=str(root),
+            pack=(cfg.policies.packs[0] if cfg.policies.packs else None),
+            profile=(cfg.llm.model or None),
+        )
+    except Exception:
+        pass
+    # Git-native mode: create/check out a per-run branch so overnight runs are reviewable.
+    if cfg.allow_apply and cfg.git.enabled:
+        ctx = ensure_git_run_branch(
+            root=root,
+            run_id=rp.run_id,
+            branch_prefix=cfg.git.branch_prefix,
+            base_branch=cfg.git.base_branch,
+            auto_stash=cfg.git.auto_stash,
+            logger=logger,
+        )
+        try:
+            save_json(
+                os.path.join(rp.state_dir, "git.json"),
+                {
+                    "enabled": bool(ctx.enabled),
+                    "run_branch": ctx.run_branch,
+                    "base_branch": ctx.base_branch,
+                    "stashed": bool(ctx.stashed),
+                },
+            )
+            try:
+                update_run_state(
+                    rp.state_dir,
+                    branch=ctx.run_branch,
+                    head_sha=head_sha(root) if ctx.enabled else None,
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
+
 
     # SQLite symbol index
     db_path = os.path.join(rp.state_dir, "symbols.sqlite")
@@ -238,7 +374,33 @@ def run_stage(
     interrupt_count = 0
     processed = 0
 
+    active_pack_name = (cfg.policies.packs[0] if cfg.policies.packs else "") or ""
+    active_pack = (
+        resolve_policy_pack(cfg.policy_packs, active_pack_name) if active_pack_name else None
+    )
+    if active_pack_name and active_pack is None:
+        logger.warn(event="policy_pack_unknown", pack=active_pack_name)
+
     for rel_path in rel_paths:
+        try:
+            update_run_state(rp.state_dir, updated_at=now_iso(), current_file=rel_path)
+        except Exception:
+            pass
+
+        # Policy pack enforcement: refuse work outside allowed globs.
+        if active_pack and active_pack.allowed_globs:
+            if not _matches_globs(rel_path, active_pack.allowed_globs):
+                logger.warn(
+                    event="policy_violation",
+                    pack=active_pack_name,
+                    rel_path=rel_path,
+                    rule="allowed_globs",
+                )
+                continue
+        # Studio stop flag (graceful cancellation)
+        if os.path.exists(os.path.join(rp.state_dir, "stop.flag")):
+            logger.warn(event="stopped", msg="stop.flag present")
+            return _finish(2, "stopped", "stop.flag present")
         if max_files is not None and processed >= max_files:
             break
 
@@ -302,12 +464,15 @@ def run_stage(
             elif stage == "edit":
                 _do_edit(
                     root=root,
+                    run_id=rp.run_id,
                     rel_path=rel_path,
                     real_abs=str(abs_path),
                     raw=raw,
                     newline=newline,
                     task_art=task_art,
                     work_abs=work_abs,
+                    state_dir=rp.state_dir,
+                    stop_flag_path=os.path.join(rp.state_dir, "stop.flag"),
                     cfg=cfg,
                     llm=llm,
                     verbose_llm=verbose_llm,
@@ -317,12 +482,15 @@ def run_stage(
             elif stage == "repair":
                 _do_repair_only(
                     root=root,
+                    run_id=rp.run_id,
                     rel_path=rel_path,
                     real_abs=str(abs_path),
                     raw=raw,
                     newline=newline,
                     task_art=task_art,
                     work_abs=work_abs,
+                    state_dir=rp.state_dir,
+                    stop_flag_path=os.path.join(rp.state_dir, "stop.flag"),
                     cfg=cfg,
                     llm=llm,
                     verbose_llm=verbose_llm,
@@ -332,12 +500,15 @@ def run_stage(
             elif stage == "run":
                 _do_run_full(
                     root=root,
+                    run_id=rp.run_id,
                     rel_path=rel_path,
                     real_abs=str(abs_path),
                     raw=raw,
                     newline=newline,
                     task_art=task_art,
                     work_abs=work_abs,
+                    state_dir=rp.state_dir,
+                    stop_flag_path=os.path.join(rp.state_dir, "stop.flag"),
                     cfg=cfg,
                     llm=llm,
                     verbose_llm=verbose_llm,
@@ -346,7 +517,7 @@ def run_stage(
                 )
             else:
                 logger.error(event="bad_stage", stage=stage)
-                return 2
+                return _finish(2, "failed", "bad stage")
 
             # Save state
             # Refresh file after possible apply
@@ -403,9 +574,9 @@ def run_stage(
                 )
                 continue
             # Third: terminate
-            return 130
+            return _finish(130, "failed", "keyboard interrupt")
 
-    return 0
+    return _finish(0, "done", "ok")
 
 
 def _do_draft(
@@ -537,12 +708,15 @@ def _do_review(
 def _do_edit(
     *,
     root: Path,
+    run_id: str,
     rel_path: str,
     real_abs: str,
     raw: bytes,
     newline: str,
     task_art: str,
     work_abs: str,
+    state_dir: str,
+    stop_flag_path: str,
     cfg: NoctuneConfig,
     llm: Optional[LLMClient],
     verbose_llm: bool,
@@ -573,6 +747,9 @@ def _do_edit(
 
     if not os.path.exists(draft_path):
         _do_draft(root, rel_path, raw, task_art, llm, verbose_llm, logger)
+
+    pack_name = (cfg.policies.packs[0] if cfg.policies.packs else "") or ""
+    pack = resolve_policy_pack(cfg.policy_packs, pack_name) if pack_name else None
 
     selection = load_json(draft_path, default={})
     targets = selection.get("targets", []) or []
@@ -801,6 +978,24 @@ def _do_edit(
             else new_code
         )
 
+        diff_lines = _changed_line_count(before_code, after_code)
+
+        # Policy pack enforcement: refuse oversize diffs.
+        if pack and pack.max_diff_lines and diff_lines > pack.max_diff_lines:
+            temp_bytes = prev_temp
+            with open(work_abs, "wb") as f:
+                f.write(temp_bytes)
+            logger.warn(
+                event="policy_violation",
+                pack=pack_name,
+                rel_path=rel_path,
+                qname=qname,
+                rule="max_diff_lines",
+                diff_lines=int(diff_lines),
+                max_diff_lines=int(pack.max_diff_lines),
+            )
+            continue
+
         approve_system = load_prompt(root, "approve.md")
         intent = str(t.get("intent", "")).strip()
         edit_prompt_ap = str(t.get("edit_prompt", "") or "").strip()
@@ -848,32 +1043,72 @@ def _do_edit(
                 out_a.strip()[:4000] + "\n",
             )
             continue
+        # Human approval gate (optional, Cline-like)
+        human_ok = True
+        if cfg.allow_apply and cfg.approvals.require_for_apply and cfg.approvals.mode in ("prompt", "file"):
+            # Policy auto-approve (small diff + glob allowlist)
+            auto_ok = False
+            auto_max = (
+                pack.auto_approve_max_diff_lines
+                if pack and pack.auto_approve_max_diff_lines
+                else cfg.policies.auto_approve_max_diff_lines
+            )
+            auto_globs = (
+                pack.auto_approve_globs
+                if pack and pack.auto_approve_globs
+                else cfg.policies.auto_approve_globs
+            )
+            if auto_max and diff_lines <= auto_max:
+                if (not auto_globs) or _matches_globs(rel_path, auto_globs):
+                    auto_ok = True
+
+            if not auto_ok:
+                req = make_request(
+                    state_dir=state_dir,
+                    run_id=run_id,
+                    file_path=rel_path,
+                    symbol=qname,
+                    before=before_code,
+                    after=after_code,
+                    risk_score=float(diff_lines),
+                    reason=(intent or "")[:200],
+                )
+                if cfg.approvals.mode == "prompt":
+                    human_ok = prompt_user(req)
+                else:
+                    dec = wait_for_decision(
+                        state_dir=state_dir,
+                        approval_id=req.approval_id,
+                        stop_flag_path=stop_flag_path,
+                        poll_s=1.0,
+                    )
+                    human_ok = bool(dec and dec.get("approved", False))
+
+        if not human_ok:
+            # revert temp
+            temp_bytes = prev_temp
+            with open(work_abs, "wb") as f:
+                f.write(temp_bytes)
+            logger.warn(event="human_rejected", rel_path=rel_path, qname=qname)
+            continue
 
         any_approved = True
 
-        # Apply to real only if allowed
+        # Apply approved temp to real (if enabled) so later edits stack cleanly
         if cfg.allow_apply:
-            ar_real = apply_replace_symbol(
-                rel_path=rel_path,
-                original_bytes=real_bytes,
-                op_qname=qname,
-                new_code=after_code,
-            )
-            if ar_real.ok:
-                real_bytes = ar_real.updated_source.encode("utf-8")
-                with open(real_abs, "wb") as f:
-                    f.write(real_bytes)
-                logger.info(event="applied", rel_path=rel_path, qname=qname)
-            else:
-                logger.warn(
-                    event="apply_real_failed",
+            with open(real_abs, "wb") as f:
+                f.write(temp_bytes)
+            real_bytes = temp_bytes
+            if cfg.git.enabled and (cfg.git.commit_strategy or "") == "each_approval":
+                maybe_git_commit(
+                    root=root,
                     rel_path=rel_path,
                     qname=qname,
-                    msg=ar_real.msg,
+                    message_template=cfg.git.commit_message,
+                    logger=logger,
                 )
 
-        # Sync temp with real after approval (so later edits stack cleanly)
-        temp_bytes = real_bytes
+        # Keep work file on latest approved content
         with open(work_abs, "wb") as f:
             f.write(temp_bytes)
 
@@ -887,18 +1122,24 @@ def _do_edit(
 def _do_repair_only(
     *,
     root: Path,
+    run_id: str,
     rel_path: str,
     real_abs: str,
     raw: bytes,
     newline: str,
     task_art: str,
     work_abs: str,
+    state_dir: str,
+    stop_flag_path: str,
     cfg: NoctuneConfig,
     llm: Optional[LLMClient],
     verbose_llm: bool,
     ruff_fix_mode: str,
     logger: EventLogger,
 ) -> None:
+    pack_name = (cfg.policies.packs[0] if cfg.policies.packs else "") or ""
+    pack = resolve_policy_pack(cfg.policy_packs, pack_name) if pack_name else None
+
     # Repair-only: run gates; if failing, apply heuristic + optional ruff --fix; do not use editor/approver.
     with open(work_abs, "wb") as f:
         f.write(raw)
@@ -925,19 +1166,91 @@ def _do_repair_only(
     # Apply repaired temp to real only if allow_apply and now clean
     if cfg.allow_apply and parse_ok and ruff_ok:
         repaired = read_bytes(work_abs)
+
+        human_ok = True
+        before_text = raw.decode("utf-8", errors="replace")
+        after_text = repaired.decode("utf-8", errors="replace")
+        diff_lines = _changed_line_count(before_text, after_text)
+
+        # Policy pack enforcement: refuse oversize diffs.
+        if pack and pack.max_diff_lines and diff_lines > pack.max_diff_lines:
+            logger.warn(
+                event="policy_violation",
+                pack=pack_name,
+                rel_path=rel_path,
+                qname="__repair_only__",
+                rule="max_diff_lines",
+                diff_lines=int(diff_lines),
+                max_diff_lines=int(pack.max_diff_lines),
+            )
+            return
+
+        if cfg.approvals.require_for_apply and cfg.approvals.mode in ("prompt", "file"):
+            auto_ok = False
+            auto_max = (
+                pack.auto_approve_max_diff_lines
+                if pack and pack.auto_approve_max_diff_lines
+                else cfg.policies.auto_approve_max_diff_lines
+            )
+            auto_globs = (
+                pack.auto_approve_globs
+                if pack and pack.auto_approve_globs
+                else cfg.policies.auto_approve_globs
+            )
+            if auto_max and diff_lines <= auto_max:
+                if (not auto_globs) or _matches_globs(rel_path, auto_globs):
+                    auto_ok = True
+
+            if not auto_ok:
+                req = make_request(
+                    state_dir=state_dir,
+                    run_id=run_id,
+                    file_path=rel_path,
+                    symbol="__repair_only__",
+                    before=before_text,
+                    after=after_text,
+                    risk_score=float(diff_lines),
+                    reason="repair-only: gates passed; applying to real file",
+                )
+                if cfg.approvals.mode == "prompt":
+                    human_ok = prompt_user(req)
+                else:
+                    dec = wait_for_decision(
+                        state_dir=state_dir,
+                        approval_id=req.approval_id,
+                        stop_flag_path=stop_flag_path,
+                        poll_s=1.0,
+                    )
+                    human_ok = bool(dec and dec.get("approved", False))
+
+        if not human_ok:
+            logger.warn(event="human_rejected", rel_path=rel_path, qname="__repair_only__")
+            return
+
         with open(real_abs, "wb") as f:
             f.write(repaired)
+        if cfg.git.enabled and (cfg.git.commit_strategy or "") == "each_approval":
+            maybe_git_commit(
+                root=root,
+                rel_path=rel_path,
+                qname="__repair_only__",
+                message_template=cfg.git.commit_message,
+                logger=logger,
+            )
 
 
 def _do_run_full(
     *,
     root: Path,
+    run_id: str,
     rel_path: str,
     real_abs: str,
     raw: bytes,
     newline: str,
     task_art: str,
     work_abs: str,
+    state_dir: str,
+    stop_flag_path: str,
     cfg: NoctuneConfig,
     llm: Optional[LLMClient],
     verbose_llm: bool,
@@ -969,12 +1282,15 @@ def _do_run_full(
 
         _do_edit(
             root=root,
+            run_id=run_id,
             rel_path=rel_path,
             real_abs=real_abs,
             raw=read_bytes(real_abs),
             newline=newline,
             task_art=task_art,
             work_abs=work_abs,
+            state_dir=state_dir,
+            stop_flag_path=stop_flag_path,
             cfg=cfg,
             llm=llm,
             verbose_llm=verbose_llm,

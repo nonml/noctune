@@ -19,6 +19,10 @@ class EventLogger:
     def _emit(self, level: str, rec: dict[str, Any]) -> None:
         if LEVELS[level] < LEVELS.get(self.level, 20):
             return
+        # Normalize legacy key name `event` -> `type` for deterministic consumers.
+        if "type" not in rec and "event" in rec:
+            rec = dict(rec)
+            rec["type"] = rec.pop("event")
         rec2 = {"ts": time.time(), "level": level, **rec}
         with open(self.events_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec2, ensure_ascii=False) + "\n")

@@ -79,6 +79,68 @@ noctune review --root . src/foo.py
 
 If you pass `--yes`, Noctune will not prompt interactively. In non-interactive mode, you must have granted permission previously by setting `allow_apply = true` in `noctune.toml`.
 
+## Noctune Studio (local chat + tools)
+
+Noctune Studio is a local-first “ChatGPT + repo tools + Noctune runs” layer.
+
+- Web app (recommended): `apps/studio-web/README.md`
+  - Chat with your OpenAI-compatible LLM (e.g. llama.cpp)
+  - Tool-calling: read/search/edit repo files (permission-gated), start/monitor Noctune runs (permission-gated)
+  - Saves chat sessions under `<repoRoot>/.noctune_cache/studio_chat/sessions/`
+- Python daemon + MCP server (optional): `noctune studio serve` / `noctune studio mcp`
+
+### Run the web app
+
+```bash
+cd apps/studio-web
+pnpm install
+cp .env.example .env.local
+# Set at least:
+# NOCTUNE_STUDIO_LLM_BASE_URL, NOCTUNE_STUDIO_LLM_MODEL
+pnpm dev
+```
+
+Open:
+- http://localhost:3000/studio
+- http://localhost:3000/studio/runs
+
+### Run the Python daemon (optional)
+
+```bash
+python -m pip install -e ".[studio]"
+noctune studio serve --root . --port 7331
+```
+
+Stop the latest run:
+
+```bash
+noctune studio stop --root .
+```
+
+Run MCP server (stdio):
+
+```bash
+noctune studio mcp
+```
+
+Notes:
+- `noctune-legacy/` is reference-only and intentionally ignored by git.
+
+## Tests
+
+This repo uses `pytest`.
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+If you don’t have a venv yet:
+
+```bash
+python -m pip install -e ".[dev]"
+python -m pytest -q
+```
+
 Artifacts are written under:
 
 - `./.noctune_cache/runs/<run_id>/artifacts/<task_id>/...`
